@@ -35,7 +35,7 @@ against real game files.
 bl_info = {
     "name": "MT Framework (MOD/LMT) Importer",
     "author": "axestyra",
-    "version": (0, 21, 7),
+    "version": (0, 21, 12),
     "blender": (3, 0, 0),
     "location": "File > Import > MT Framework Model / Animation",
     "description": "Import/export MT Framework LMT with native BoneID 255 root-motion vector encoding.",
@@ -476,7 +476,7 @@ class IMPORT_OT_mt_framework_mod(bpy.types.Operator, ImportHelper):
         name="Collection per LOD", default=False,
         description="Group meshes into a collection per LOD level")
     keep_debug_info: BoolProperty(
-        name="Keep debug info in name", default=True,
+        name="Keep debug info in name", default=False,
         description="Append the decoder format id to each mesh name")
     import_textures: BoolProperty(
         name="Import Textures / Materials", default=True,
@@ -566,7 +566,7 @@ class IMPORT_OT_mt_framework_lmt(bpy.types.Operator, ImportHelper):
         description="Key per-bone position tracks too. Turn off for "
                     "rotation-only animation if a position track misbehaves")
     set_timeline: BoolProperty(
-        name="Set Timeline to Animation Length", default=True,
+        name="Set Timeline to Animation Length", default=False,
         description="Set the scene's frame range (and each Action's range) to "
                     "the animation length, like the 3ds Max MT Framework tool")
 
@@ -624,30 +624,29 @@ class EXPORT_OT_mt_framework_lmt(bpy.types.Operator, ExportHelper):
 
     filename_ext = ".lmt"
     filter_glob: StringProperty(default="*.lmt", options={"HIDDEN"})
-    source_lmt: StringProperty(
-        name="Source LMT", subtype="FILE_PATH", default="",
-        description="Original game LMT; other slots and unknown tracks are preserved")
     slot_index: IntProperty(
-        name="Replace Slot (0-based)", default=1, min=0,
-        description="Physical slot index in the source LMT, including empty slots")
+        name="Animation ID (0-based)", default=0, min=0,
+        description="Dense animation ID: 0 = first populated animation (e.g. 00_loop), 1 = second, skipping empty LMT slots")
     arch_64bit: BoolProperty(
         name="64-bit Pointer Layout", default=False,
         description="Reserved for newer LMT variants; currently unsupported by safe export")
     selected_bones_only: BoolProperty(
-        name="Export Selected Bones Only", default=True,
+        name="Export Selected Bones Only", default=False,
         description="Only rewrite tracks belonging to selected pose bones; preserve all other tracks and codecs")
 
     def draw(self, context):
         layout = self.layout
         layout.label(text="Replace one animation in an existing LMT.")
-        layout.prop(self, "source_lmt")
+        layout.prop(context.window_manager, "mtf_lmt_source_path", text="Source LMT")
+        layout.operator(
+            "wm.mtf_lmt_use_selected_file",
+            text="Use Selected File as Source",
+            icon="FILE_TICK",
+        )
+        layout.label(text="Animation ID is 0-based and skips empty slots: 0 = first clip, 1 = second clip, etc.")
         layout.prop(self, "slot_index")
         layout.prop(self, "arch_64bit")
         layout.prop(self, "selected_bones_only")
-        layout.label(text="Export patches only edited tracks and appends their buffers; no full-container repack.")
-        layout.label(text="Keep only the edited pose bone(s) selected. Use a game-native source LMT, not a compact repack.")
-        layout.label(text="Source slot frame count and loop are preserved automatically.")
-        layout.label(text="BoneID 255 / Usage 4 uses native Type 4 + Bounds root-motion encoding.")
         arm = _active_armature(context)
         if arm is None:
             layout.label(text="Select an armature first", icon="ERROR")
@@ -668,9 +667,25 @@ class EXPORT_OT_mt_framework_lmt(bpy.types.Operator, ExportHelper):
             return {"CANCELLED"}
         try:
             from .lmt_export import export_lmt
+            raw_source = context.window_manager.mtf_lmt_source_path.strip()
+            # Typed or pasted paths may be wrapped in quotes; remove matching
+            # outer quotes and expand common path forms.
+            if len(raw_source) >= 2 and raw_source[0] == raw_source[-1] and raw_source[0] in ("\"", "'"):
+                raw_source = raw_source[1:-1].strip()
+            source_path = ""
+            if raw_source:
+                source_path = os.path.normpath(
+                    bpy.path.abspath(os.path.expandvars(os.path.expanduser(raw_source)))
+                )
+            if not source_path or not os.path.isfile(source_path):
+                self.report({"ERROR"}, "Source LMT path is empty or does not exist. Enter the full path to an existing .lmt file.")
+                return {"CANCELLED"}
+            if not source_path.lower().endswith(".lmt"):
+                self.report({"ERROR"}, "Source file must have the .lmt extension.")
+                return {"CANCELLED"}
             count = export_lmt(
                 self.filepath, arm, context.scene,
-                source_lmt=bpy.path.abspath(self.source_lmt),
+                source_lmt=source_path,
                 slot_index=self.slot_index,
                 x64=self.arch_64bit,
                 selected_bones=selected_names if self.selected_bones_only else None,
@@ -681,6 +696,48 @@ class EXPORT_OT_mt_framework_lmt(bpy.types.Operator, ExportHelper):
             traceback.print_exc()
             return {"CANCELLED"}
         self.report({"INFO"}, "Patched source LMT in place (%d track(s) updated)." % count)
+        return {"FINISHED"}
+
+
+class WM_OT_mtf_lmt_use_selected_file(bpy.types.Operator):
+    """Copy the active file-browser entry into the Source LMT textbox."""
+    bl_idname = "wm.mtf_lmt_use_selected_file"
+    bl_label = "Use Selected File as Source"
+    bl_description = "Use the currently active file in this Blender file browser as Source LMT"
+    bl_options = {"INTERNAL"}
+
+    def execute(self, context):
+        space = context.space_data
+        if not space or getattr(space, "type", None) != "FILE_BROWSER":
+            self.report({"ERROR"}, "Use this button from the Export LMT file browser.")
+            return {"CANCELLED"}
+
+        params = getattr(space, "params", None)
+        if params is None:
+            self.report({"ERROR"}, "Could not read the file-browser selection.")
+            return {"CANCELLED"}
+
+        directory = getattr(params, "directory", "") or ""
+        if isinstance(directory, bytes):
+            directory = os.fsdecode(directory)
+        filename = (getattr(params, "filename", "") or "").strip()
+        if not filename:
+            self.report({"ERROR"}, "Select an existing .lmt file in the left file list first.")
+            return {"CANCELLED"}
+
+        # Some Blender versions expose a directory ending in a separator; normpath
+        # safely handles both that case and Windows-style paths.
+        path = filename if os.path.isabs(filename) else os.path.join(directory, filename)
+        path = os.path.normpath(bpy.path.abspath(os.path.expandvars(os.path.expanduser(path))))
+        if not os.path.isfile(path):
+            self.report({"ERROR"}, "The active file is not an existing file: %s" % path)
+            return {"CANCELLED"}
+        if not path.lower().endswith(".lmt"):
+            self.report({"ERROR"}, "Select a .lmt file in the left file list.")
+            return {"CANCELLED"}
+
+        context.window_manager.mtf_lmt_source_path = path
+        self.report({"INFO"}, "Source LMT set to %s" % os.path.basename(path))
         return {"FINISHED"}
 
 
@@ -836,13 +893,21 @@ class VIEW3D_PT_mt_framework(bpy.types.Panel):
 
 
 _classes = (IMPORT_OT_mt_framework_mod, IMPORT_OT_mt_framework_lmt,
-            EXPORT_OT_mt_framework_lmt, EXPORT_OT_mt_framework_model,
-            VIEW3D_PT_mt_framework)
+            WM_OT_mtf_lmt_use_selected_file, EXPORT_OT_mt_framework_lmt,
+            EXPORT_OT_mt_framework_model, VIEW3D_PT_mt_framework)
 
 
 def register():
     for cls in _classes:
         bpy.utils.register_class(cls)
+    # Plain editable source-path field; the adjacent operator can copy the
+    # active file-browser entry into it. No FILE_PATH subtype means no browse button.
+    bpy.types.WindowManager.mtf_lmt_source_path = StringProperty(
+        name="Source LMT",
+        default="",
+        maxlen=4096,
+        description="Full path to the original game LMT; enter or paste a path, or select a file and use the button below.",
+    )
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
     bpy.types.TOPBAR_MT_file_export.append(menu_func_export)
 
@@ -850,6 +915,8 @@ def register():
 def unregister():
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
     bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)
+    if hasattr(bpy.types.WindowManager, "mtf_lmt_source_path"):
+        del bpy.types.WindowManager.mtf_lmt_source_path
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)
 

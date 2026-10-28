@@ -4,7 +4,7 @@
 Only edited track definitions are changed. New track buffers are appended to
 an otherwise byte-for-byte copy of the source file. No slot headers, existing
 buffers, bounds blocks, or unrelated slot pointers are compacted or relocated.
-Supported edited tracks use Type 6 quaternion and Type 3 vector codecs.
+Supported edited tracks use native-compatible quaternion/vector codecs; root translation uses Type 4 + Bounds.
 """
 import os
 import struct
@@ -19,10 +19,6 @@ MTFCORMAT_4 = mathutils.Matrix((
     (0.0, 1.0, 0.0, 0.0),
     (0.0, 0.0, 0.0, 1.0),
 ))
-
-
-def _align(data, alignment=4):
-    return data + (b"\0" * ((-len(data)) % alignment))
 
 
 def _read_source(path, slot, x64=False):
@@ -257,151 +253,28 @@ def _sample_track(scene, arm, pb, usage, frame_count, frame_start):
 
 
 
-def _parse_block_tracks(data, slot_offset, version):
-    """Read one animation slot and capture every raw buffer/bounds payload."""
-    if slot_offset < 8 or slot_offset + 16 > len(data):
-        raise ValueError("Animation slot header lies outside the LMT file")
-    defs_offset, track_count, frame_count, loop_frame = struct.unpack_from("<IIIi", data, slot_offset)
-    def_size = 36 if version > 55 else 32
-    if track_count > 4096 or not frame_count or frame_count > 100000:
-        raise ValueError("Implausible track/frame count in slot")
-    if defs_offset < 8 or defs_offset + track_count * def_size > len(data):
-        raise ValueError("Animation track definitions lie outside the LMT file")
-    tracks = []
-    for i in range(track_count):
-        p = defs_offset + i * def_size
-        raw = bytes(data[p:p + def_size])
-        bt, usage, joint, bone = struct.unpack_from("<4B", raw, 0)
-        buf_size, buf_off = struct.unpack_from("<II", raw, 8)
-        bounds_off = struct.unpack_from("<I", raw, 32)[0] if version > 55 else 0
-        if buf_size and (buf_off < 8 or buf_off + buf_size > len(data)):
-            raise ValueError("Track buffer for slot points outside the LMT file")
-        buffer = bytes(data[buf_off:buf_off + buf_size]) if buf_size else b""
-        bounds = None
-        if bounds_off:
-            if bounds_off < 8 or bounds_off + 32 > len(data):
-                raise ValueError("Track bounds for slot point outside the LMT file")
-            bounds = bytes(data[bounds_off:bounds_off + 32])
-        tracks.append({
-            "raw": raw, "buffer": buffer, "bounds_data": bounds, "new": False,
-            "weight": struct.unpack_from("<f", raw, 4)[0],
-            "type": bt, "usage": usage, "joint": joint, "bone": bone,
-        })
-    return {"frame_count": frame_count, "loop_frame": loop_frame, "tracks": tracks}
+def _resolve_animation_id(source_lmt, animation_id):
+    """Map a dense, user-facing animation ID to the physical LMT table slot.
 
-
-def _write_repacked_lmt(filepath, source, version, slot_count, block_map):
-    """Rebuild the full container with native-style grouped slot headers.
-
-    The header table maps populated animation slots to a 0x40-stride header area.
-    Each slot's definitions and payloads follow that area. Identical payload bytes
-    are shared to avoid bloating the file and to retain the source's common aliasing.
+    The importer omits empty offset-table entries, so its animation 0 is the
+    first non-zero slot pointer, animation 1 is the second, and so on.
     """
-    def_size = 36 if version > 55 else 32
-    out = bytearray(b"LMT\0" + struct.pack("<HH", version, slot_count))
-    out.extend(b"\0" * (slot_count * 4))
-    while len(out) < 0x410:
-        out.append(0)
-
-    slots = sorted(block_map)
-    header_offsets = {slot: 0x410 + i * 0x40 for i, slot in enumerate(slots)}
-    out.extend(b"\0" * (len(slots) * 0x40))
-    for slot in slots:
-        tail = block_map[slot].get("header_tail")
-        if tail is None or len(tail) != 48:
-            raise ValueError("Source slot header metadata is missing; use the repaired/native-layout LMT as source")
-        extra = block_map[slot].get("header_extra")
-        if not isinstance(extra, bytes) or not extra:
-            raise ValueError("Source slot auxiliary metadata is missing; export cancelled to avoid data loss")
-        row = header_offsets[slot]
-        out[row + 16:row + 64] = tail
-    buffer_offsets = {}
-    bounds_offsets = {}
-
-    for slot in slots:
-        block = block_map[slot]
-        tracks = block["tracks"]
-        while len(out) % 4:
-            out.append(0)
-        defs_offset = len(out)
-        defs_table_offset = len(out)
-        out.extend(b"\0" * (len(tracks) * def_size))
-        definitions = []
-
-        for track in tracks:
-            raw = track.get("raw")
-            buffer = bytes(track.get("buffer", b"") or b"")
-            bounds_data = track.get("bounds_data")
-            buffer_offset = 0
-            bounds_offset = 0
-
-            if buffer:
-                if buffer in buffer_offsets:
-                    buffer_offset = buffer_offsets[buffer]
-                else:
-                    while len(out) % 4:
-                        out.append(0)
-                    buffer_offset = len(out)
-                    out.extend(buffer)
-                    buffer_offsets[buffer] = buffer_offset
-
-            if bounds_data is not None:
-                bounds_data = bytes(bounds_data)
-                if bounds_data in bounds_offsets:
-                    bounds_offset = bounds_offsets[bounds_data]
-                else:
-                    while len(out) % 4:
-                        out.append(0)
-                    bounds_offset = len(out)
-                    out.extend(bounds_data)
-                    bounds_offsets[bounds_data] = bounds_offset
-
-            if track.get("new"):
-                item = track
-                ref = item["ref"]
-                if version > 55:
-                    definition = struct.pack(
-                        "<4BfII4fI", int(item["type"]), int(item["usage"]),
-                        int(item["joint"]), int(item["bone"]), float(item["weight"]),
-                        len(buffer), buffer_offset, *[float(x) for x in ref], bounds_offset)
-                else:
-                    definition = struct.pack(
-                        "<4BfII4f", int(item["type"]), int(item["usage"]),
-                        int(item["joint"]), int(item["bone"]), float(item["weight"]),
-                        len(buffer), buffer_offset, *[float(x) for x in ref])
-            else:
-                if raw is None or len(raw) != def_size:
-                    raise ValueError("Invalid preserved track definition")
-                definition = bytearray(raw)
-                struct.pack_into("<II", definition, 8, len(buffer), buffer_offset)
-                if version > 55:
-                    struct.pack_into("<I", definition, 32, bounds_offset)
-                definition = bytes(definition)
-
-            if len(definition) != def_size:
-                raise AssertionError("Internal track definition size mismatch")
-            definitions.append(definition)
-
-        for i, definition in enumerate(definitions):
-            pos = defs_table_offset + i * def_size
-            out[pos:pos + def_size] = definition
-        struct.pack_into("<IIIi", out, header_offsets[slot], defs_offset, len(tracks),
-                         int(block["frame_count"]), int(block["loop_frame"]))
-        # Preserve the slot's 4-byte terminator or 21-track auxiliary record.
-        # The header's +0x34 field is a pointer to that data, not a generic block end.
-        while len(out) % 4:
-            out.append(0)
-        extra_offset = len(out)
-        extra = block["header_extra"]
-        out.extend(extra)
-        struct.pack_into("<I", out, header_offsets[slot] + 0x34, extra_offset)
-        struct.pack_into("<I", out, 8 + slot * 4, header_offsets[slot])
-
-    while len(out) % 16:
-        out.append(0)
-    with open(filepath, "wb") as fh:
-        fh.write(out)
-    return len(out)
+    with open(source_lmt, "rb") as fh:
+        header = fh.read(8)
+        if len(header) < 8 or header[:4] != b"LMT\0":
+            raise ValueError("Source LMT has an invalid signature or truncated header")
+        _version, slot_count = struct.unpack_from("<HH", header, 4)
+        table_size = slot_count * 4
+        table = fh.read(table_size)
+    if slot_count == 0 or len(table) != table_size:
+        raise ValueError("Source LMT animation offset table is invalid or truncated")
+    offsets = struct.unpack("<%dI" % slot_count, table)
+    populated = [physical for physical, offset in enumerate(offsets) if offset]
+    if animation_id < 0 or animation_id >= len(populated):
+        raise ValueError(
+            "Animation ID %d is out of range (valid populated animation IDs: 0..%d; %d clips found)."
+            % (animation_id, len(populated) - 1, len(populated)))
+    return populated[animation_id]
 
 
 def export_lmt(filepath, arm_obj, scene, source_lmt, slot_index, x64=False,
@@ -421,8 +294,13 @@ def export_lmt(filepath, arm_obj, scene, source_lmt, slot_index, x64=False,
     if action is None:
         raise ValueError("The selected armature has no active Action")
 
+    animation_id = int(slot_index)
+    if animation_id < 0:
+        raise ValueError("Animation ID must be 0 or greater")
+    # UI IDs are dense over populated animations; empty physical LMT slots are skipped.
+    physical_slot = _resolve_animation_id(source_lmt, animation_id)
     source, version, slot_count, offsets, slot, frame_count, loop_frame, selected_defs = _read_source(
-        source_lmt, int(slot_index), x64=x64)
+        source_lmt, physical_slot, x64=x64)
     if version <= 50:
         raise ValueError("Safe export currently requires LMT version 51 or newer")
     def_size = 36 if version > 55 else 32
