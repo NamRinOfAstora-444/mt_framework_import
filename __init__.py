@@ -35,10 +35,10 @@ against real game files.
 bl_info = {
     "name": "MT Framework (MOD/LMT) Importer",
     "author": "axestyra",
-    "version": (0, 21, 6),
+    "version": (0, 21, 7),
     "blender": (3, 0, 0),
     "location": "File > Import > MT Framework Model / Animation",
-    "description": "Import and export MT Framework MOD/LMT animations with BoneID 255 keyed as a normal root bone.",
+    "description": "Import/export MT Framework LMT with native BoneID 255 root-motion vector encoding.",
     "doc_url": "",
     "tracker_url": "",
     "category": "Import-Export",
@@ -647,6 +647,7 @@ class EXPORT_OT_mt_framework_lmt(bpy.types.Operator, ExportHelper):
         layout.label(text="Export patches only edited tracks and appends their buffers; no full-container repack.")
         layout.label(text="Keep only the edited pose bone(s) selected. Use a game-native source LMT, not a compact repack.")
         layout.label(text="Source slot frame count and loop are preserved automatically.")
+        layout.label(text="BoneID 255 / Usage 4 uses native Type 4 + Bounds root-motion encoding.")
         arm = _active_armature(context)
         if arm is None:
             layout.label(text="Select an armature first", icon="ERROR")

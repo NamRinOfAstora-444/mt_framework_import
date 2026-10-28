@@ -100,6 +100,26 @@ def _bone_by_mtf_index(arm, bone_id):
     return None
 
 
+def _resolve_track_bone(arm, bone_id, usage, action, selected_bones=None):
+    """Resolve a track to a pose bone, including renamed root bones in selected-only mode."""
+    pb = _bone_by_mtf_index(arm, bone_id)
+    if pb is not None and _action_has_curve(action, pb.name, usage):
+        return pb
+    # Root motion is BoneID 255 / Usage 4. Older .blend files may not retain
+    # mtf_root_bone metadata, or the synthetic bone may have been renamed.
+    # In selected-only mode, an explicitly selected bone with keyed Location
+    # is an unambiguous user override for this root track.
+    if bone_id == 255 and usage == 4 and selected_bones:
+        candidates = [
+            arm.pose.bones.get(name) for name in selected_bones
+            if arm.pose.bones.get(name) is not None
+            and _action_has_curve(action, name, usage)
+        ]
+        if len(candidates) == 1:
+            return candidates[0]
+    return pb
+
+
 def _action_has_curve(action, bone_name, usage):
     if action is None:
         return False
@@ -151,6 +171,59 @@ def _encode_quat(q, delta):
     iv1 = (w & 0x3FFF) | ((z & 0x3FFF) << 14) | ((y & 0xF) << 28)
     iv2 = (y >> 4 & 0x3FF) | ((x & 0x3FFF) << 10) | ((max(0, min(255, delta)) & 0xFF) << 24)
     return struct.pack("<II", iv1, iv2)
+
+
+def _encode_root_motion_position(values, loop_frame):
+    """Encode BoneID 255 / Usage 4 using the native v56+ vector codec.
+
+    In the supplied MHGU LMT, animated root-translation tracks use BufferType
+    4 (16-bit quantized Vector3) or 5 (8-bit quantized Vector3), with a 32-byte
+    Bounds record. The previous exporter wrote BufferType 3 and no Bounds
+    pointer for every vector track; keep ordinary bone vectors on that path,
+    but write root motion in the native quantized format.
+
+    The ReferenceFrame position is sampled at the loop pivot when LoopFrame is
+    positive, otherwise at frame 0. Native clips use ReferenceFrame.w = 0 for
+    a positive loop pivot and 1 for LoopFrame 0 / -1.
+    """
+    if not values:
+        raise ValueError("Root motion track has no sampled position values")
+
+    vectors = [tuple(float(v[k]) for k in range(3)) for v in values]
+    mins = [min(v[k] for v in vectors) for k in range(3)]
+    maxs = [max(v[k] for v in vectors) for k in range(3)]
+    # Native Bounds records use (offset + fraction * addin). A small non-zero
+    # range is used for axes that do not move, matching existing LMT samples.
+    addin = [max(maxs[k] - mins[k], 1.0e-5) for k in range(3)]
+    offset = mins[:]
+    bounds_data = struct.pack(
+        "<8f", addin[0], addin[1], addin[2], 1.0e-5,
+        offset[0], offset[1], offset[2], 0.0,
+    )
+    # Quantize against the float32 values that will actually be written to LMT.
+    addin32 = struct.unpack_from("<4f", bounds_data, 0)
+    offset32 = struct.unpack_from("<4f", bounds_data, 16)
+
+    buffer = bytearray()
+    for index, vector in enumerate(vectors):
+        quantized = []
+        for axis in range(3):
+            frac = (vector[axis] - offset32[axis]) / addin32[axis]
+            quantized.append(max(0, min(65535, int(round(frac * 65535.0)))))
+        # BufferType 4 stores x/y/z ushort plus ushort frame delta. The final
+        # key has delta 0; all preceding samples are one frame apart.
+        delta = 1 if index < len(vectors) - 1 else 0
+        buffer.extend(struct.pack("<4H", quantized[0], quantized[1], quantized[2], delta))
+
+    try:
+        loop_index = int(loop_frame)
+    except (TypeError, ValueError):
+        loop_index = -1
+    loop_index = loop_index if 0 < loop_index < len(vectors) else 0
+    reference_w = 0.0 if int(loop_frame) > 0 else 1.0
+    reference = (vectors[loop_index][0], vectors[loop_index][1],
+                 vectors[loop_index][2], reference_w)
+    return bytes(buffer), bounds_data, reference
 
 
 def _sample_track(scene, arm, pb, usage, frame_count, frame_start):
@@ -407,7 +480,8 @@ def export_lmt(filepath, arm_obj, scene, source_lmt, slot_index, x64=False,
         for tr in tracks:
             if tr["usage"] not in (0, 1, 2, 3, 4):
                 continue
-            pb = _bone_by_mtf_index(arm_obj, tr["bone"])
+            pb = _resolve_track_bone(
+                arm_obj, tr["bone"], tr["usage"], action, selected_bones)
             if pb is not None and _action_has_curve(action, pb.name, tr["usage"]):
                 supported.append(pb.name)
         selected_track_count = sum(1 for name in supported if name in selected_bones)
@@ -423,7 +497,8 @@ def export_lmt(filepath, arm_obj, scene, source_lmt, slot_index, x64=False,
             usage, bone_id = tr["usage"], tr["bone"]
             if usage not in (0, 1, 2, 3, 4):
                 continue
-            pb = _bone_by_mtf_index(arm_obj, bone_id)
+            pb = _resolve_track_bone(
+                arm_obj, bone_id, usage, action, selected_bones)
             if pb is None:
                 continue
             if selected_bones is not None and pb.name not in selected_bones:
@@ -434,7 +509,14 @@ def export_lmt(filepath, arm_obj, scene, source_lmt, slot_index, x64=False,
             vals = _sample_track(scene, arm_obj, pb, usage, frame_count, frame_start)
             if not vals:
                 continue
-            if usage in (0, 3):
+            bounds_data = None
+            is_root_translation = (bone_id == 255 and usage == 4 and version > 55)
+            if is_root_translation:
+                # Root motion in native v67 samples is BoneID 255 / Usage 4,
+                # stored as Type 4 + 32-byte Bounds, not generic float Type 3.
+                buffer, bounds_data, ref = _encode_root_motion_position(vals, loop_frame)
+                bt = 4
+            elif usage in (0, 3):
                 buffer = b"".join(_encode_quat(q, 1) for q in vals)
                 first = vals[0]
                 ref = (float(first.x), float(first.y), float(first.z), float(first.w))
@@ -446,13 +528,17 @@ def export_lmt(filepath, arm_obj, scene, source_lmt, slot_index, x64=False,
                 ref = (float(first.x), float(first.y), float(first.z), 0.0)
                 bt = 3
             updates.append({"track": tr, "type": bt, "usage": usage, "buffer": buffer,
-                            "ref": ref})
+                            "bounds_data": bounds_data, "ref": ref})
     finally:
         scene.frame_set(old_frame)
 
     if not updates:
         if selected_bones is not None:
-            raise ValueError("No supported keyed tracks found for the selected pose bone(s)")
+            raise ValueError(
+                "No supported keyed tracks found for selected bone(s): %s. "
+                "For root motion, select the root bone that has Location keyframes "
+                "and confirm the active Action contains those keyframes."
+                % ", ".join(sorted(selected_bones)))
         raise ValueError("No supported keyed tracks found in the active Action")
 
     out = bytearray(source)
@@ -463,11 +549,18 @@ def export_lmt(filepath, arm_obj, scene, source_lmt, slot_index, x64=False,
             out.append(0)
         new_buffer_offset = len(out)
         out.extend(buffer)
+        bounds_offset = 0
+        bounds_data = upd.get("bounds_data")
+        if bounds_data:
+            while len(out) % 4:
+                out.append(0)
+            bounds_offset = len(out)
+            out.extend(bounds_data)
         ref = upd["ref"]
         if version > 55:
             new_def = struct.pack(
                 "<4BfII4fI", upd["type"], upd["usage"], tr["joint"], tr["bone"],
-                tr["weight"], len(buffer), new_buffer_offset, *ref, 0)
+                tr["weight"], len(buffer), new_buffer_offset, *ref, bounds_offset)
         else:
             new_def = struct.pack(
                 "<4BfII4f", upd["type"], upd["usage"], tr["joint"], tr["bone"],
