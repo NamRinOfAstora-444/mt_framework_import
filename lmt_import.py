@@ -111,51 +111,6 @@ def _root255_target_position(arm_obj, v, root_basis=None):
     return basis @ v
 
 
-def _apply_root_motion_to_object(
-    arm_obj,
-    v,
-    root_basis,
-    frame,
-):
-    """
-    Apply BoneID 255 / Usage 4 root motion to the Armature Object.
-
-    bone255 itself is not animated and is not the parent of the skeleton.
-    It only defines the reference axes.
-
-    The converted motion is keyed on armature.location.
-    """
-
-    target = _root255_target_position(
-        arm_obj,
-        v,
-        root_basis,
-    )
-
-    # Preserve the object's location before animation import.
-    base = arm_obj.get(
-        "mtf_root_motion_base_location"
-    )
-
-    if base is None:
-        base = tuple(
-            float(x)
-            for x in arm_obj.location
-        )
-
-        arm_obj["mtf_root_motion_base_location"] = base
-
-    base_vec = mathutils.Vector(base)
-
-    arm_obj.location = base_vec + target
-
-    arm_obj.keyframe_insert(
-        "location",
-        frame=frame,
-        group="Root Motion",
-    )
-
-
 # ============================================================
 # ROTATION HELPERS
 # ============================================================
@@ -345,65 +300,42 @@ def _resolve_pose_bone(
     rootid,
     bone_id,
 ):
-    """
-    Resolve an LMT bone ID into a Blender pose bone.
+    """Resolve an LMT bone ID into its Blender pose bone.
 
-    Bone255 is a synthetic root-motion controller.
+    BoneID 255 is the actual keyed root track in this add-on. Its rotation
+    and location belong to pose.bones["bone255"], not Armature Object.location.
+    If a game-specific root bone was explicitly assigned for MHGU/DMC4 SE,
+    retain that mapping; otherwise resolve the real MT index 255 bone.
     """
 
     if bone_id is None:
         return None
 
-    # --------------------------------------------------------
-    # Root / synthetic root
-    # --------------------------------------------------------
-
-    if (
-        bone_id == rootid
-        or (
-            rootid == 255
-            and bone_id == 255
-        )
-    ):
-
-        game_root = arm_obj.get(
-            "mtf_game_root_bone"
-        )
-
+    # Root handling is deliberate and explicit. Do not skip bone255 and fall
+    # through to the first deforming bone: that would apply root keys to the
+    # wrong bone and create the visible weapon/body offset the user reported.
+    if bone_id == rootid or bone_id == 255:
+        game_root = arm_obj.get("mtf_game_root_bone")
         if game_root:
-
-            pbone = arm_obj.pose.bones.get(
-                game_root
-            )
-
+            pbone = arm_obj.pose.bones.get(game_root)
             if pbone is not None:
                 return pbone
 
-        # Compatibility fallback
-        root_name = arm_obj.get(
-            "mtf_root_bone",
-            "bone255",
-        )
+        root_name = arm_obj.get("mtf_root_bone", "bone255")
+        pbone = arm_obj.pose.bones.get(root_name)
+        if pbone is not None:
+            return pbone
 
-        if root_name != "bone255":
+        # Also support renamed bones by their persistent MT index.
+        pbone = _find_pose_bone_by_mtf_index(arm_obj, 255)
+        if pbone is not None:
+            return pbone
 
-            pbone = arm_obj.pose.bones.get(
-                root_name
-            )
-
-            if pbone is not None:
-                return pbone
-
-        # Last resort:
-        # first deforming root
+        # Last compatibility fallback for older .blend files that have no
+        # synthetic/root-index bone but contain an explicit game root.
         for pbone in arm_obj.pose.bones:
-
-            if (
-                pbone.bone.parent is None
-                and pbone.bone.use_deform
-            ):
+            if pbone.bone.parent is None and pbone.bone.use_deform:
                 return pbone
-
         return None
 
     # --------------------------------------------------------
@@ -443,6 +375,57 @@ def _resolve_pose_bone(
 # ============================================================
 # ANIMATION APPLICATION
 # ============================================================
+
+def _remove_object_root_motion_curves(action):
+    """Remove legacy Armature Object.location channels from imported actions.
+
+    Earlier addon builds keyed MT root translation on Armature Object.location
+    in a group named "Root Motion". The rebuilt importer keys those values on
+    BoneID 255's pose bone instead. Strip only object-level `location` curves;
+    pose.bones["bone255"].location curves are left untouched.
+    Supports both legacy FCurve Actions and layered Actions where available.
+    """
+    collections = []
+
+    # Legacy actions (Blender <= 4.3, and legacy actions kept by newer Blender).
+    try:
+        collections.append(action.fcurves)
+    except (AttributeError, TypeError, RuntimeError):
+        pass
+
+    # Layered actions (Blender 4.4+). Each strip may have a channel bag per slot.
+    try:
+        for layer in action.layers:
+            for strip in layer.strips:
+                for slot in action.slots:
+                    try:
+                        bag = strip.channelbag(slot)
+                    except (AttributeError, TypeError, RuntimeError):
+                        bag = None
+                    if bag is not None:
+                        collections.append(bag.fcurves)
+    except (AttributeError, TypeError, RuntimeError):
+        pass
+
+    seen = set()
+    for curves in collections:
+        ident = id(curves)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        try:
+            curve_list = list(curves)
+        except (TypeError, RuntimeError):
+            continue
+        for fc in curve_list:
+            # Armature Object.location only. Pose-bone paths include
+            # pose.bones[...], so the root bone's location keys are preserved.
+            if fc.data_path == "location":
+                try:
+                    curves.remove(fc)
+                except (ReferenceError, RuntimeError, TypeError):
+                    pass
+
 
 def apply_animation(
     arm_obj,
@@ -490,6 +473,10 @@ def apply_animation(
 
     arm_obj.animation_data.action = action
 
+    # Remove stale object-level root-motion channels from actions imported by
+    # older builds. BoneID 255 is animated through its own pose-bone channels.
+    _remove_object_root_motion_curves(action)
+
     # --------------------------------------------------------
     # Key filtering
     # --------------------------------------------------------
@@ -530,37 +517,9 @@ def apply_animation(
             track.BoneID == rootid
         )
 
-        # ====================================================
-        # ROOT MOTION
-        # ====================================================
-
-        if (
-            is_root_track
-            and usage == 4
-            and include_location
-        ):
-
-            for key in track.FrameArray:
-
-                if not _key_in_range(key):
-                    continue
-
-                v = key.value
-
-                if not isinstance(
-                    v,
-                    mathutils.Vector,
-                ):
-                    continue
-
-                _apply_root_motion_to_object(
-                    arm_obj,
-                    v,
-                    root255_basis,
-                    _dst_frame(key),
-                )
-
-            continue
+        # BoneID 255 tracks (including Usage 4 translation) are keyed on the
+        # mapped root pose bone, as ordinary pose-bone animation. Never create
+        # a separate Armature Object.location / "Root Motion" channel.
 
         # ====================================================
         # NORMAL BONE
@@ -668,8 +627,8 @@ def apply_animation(
                     continue
 
                 if (
-                    usage == 1
-                    and is_game_root
+                    usage in (1, 4)
+                    and (is_game_root or is_root_track)
                 ):
 
                     target = (

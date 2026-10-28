@@ -35,10 +35,10 @@ against real game files.
 bl_info = {
     "name": "MT Framework (MOD/LMT) Importer",
     "author": "axestyra",
-    "version": (0, 20, 8),
+    "version": (0, 21, 6),
     "blender": (3, 0, 0),
     "location": "File > Import > MT Framework Model / Animation",
-    "description": "Import Capcom MT Framework MOD models and LMT animations.",
+    "description": "Import and export MT Framework MOD/LMT animations with BoneID 255 keyed as a normal root bone.",
     "doc_url": "",
     "tracker_url": "",
     "category": "Import-Export",
@@ -128,10 +128,10 @@ def build_armature(mbones, header, context, collection):
     # Visible bone length scaled to the model (skinning is unaffected by length).
     blen = max(1.0, header.vtbuffscale.length * 0.02)
 
-    # The original 3ds Max importer always creates a synthetic bone255 root
-    # using MTFCormat.  Older LMT generations (including MHGU v67 files) store
-    # root motion on BoneID=255 / Usage=4.  Without this helper bone Blender
-    # silently drops the track and travelling animations become in-place.
+    # Create the MT root bone with index 255 using MTFCormat. LMT tracks for
+    # BoneID 255 are normal pose-bone animation: they are keyed on bone255's
+    # pose channels, never on Armature Object.location. This root-bone mapping
+    # is retained for MHGU and DMC4 SE.
     root_eb = edit_bones.new("bone255")
     root_eb.head = (0.0, 0.0, 0.0)
     root_eb.tail = (0.0, blen, 0.0)
@@ -624,11 +624,29 @@ class EXPORT_OT_mt_framework_lmt(bpy.types.Operator, ExportHelper):
 
     filename_ext = ".lmt"
     filter_glob: StringProperty(default="*.lmt", options={"HIDDEN"})
+    source_lmt: StringProperty(
+        name="Source LMT", subtype="FILE_PATH", default="",
+        description="Original game LMT; other slots and unknown tracks are preserved")
+    slot_index: IntProperty(
+        name="Replace Slot (0-based)", default=1, min=0,
+        description="Physical slot index in the source LMT, including empty slots")
+    arch_64bit: BoolProperty(
+        name="64-bit Pointer Layout", default=False,
+        description="Reserved for newer LMT variants; currently unsupported by safe export")
+    selected_bones_only: BoolProperty(
+        name="Export Selected Bones Only", default=True,
+        description="Only rewrite tracks belonging to selected pose bones; preserve all other tracks and codecs")
 
     def draw(self, context):
         layout = self.layout
-        layout.label(text="Exports the active Action as one LMT animation.")
-        layout.label(text="Current exporter format: little-endian v55.")
+        layout.label(text="Replace one animation in an existing LMT.")
+        layout.prop(self, "source_lmt")
+        layout.prop(self, "slot_index")
+        layout.prop(self, "arch_64bit")
+        layout.prop(self, "selected_bones_only")
+        layout.label(text="Export patches only edited tracks and appends their buffers; no full-container repack.")
+        layout.label(text="Keep only the edited pose bone(s) selected. Use a game-native source LMT, not a compact repack.")
+        layout.label(text="Source slot frame count and loop are preserved automatically.")
         arm = _active_armature(context)
         if arm is None:
             layout.label(text="Select an armature first", icon="ERROR")
@@ -643,15 +661,25 @@ class EXPORT_OT_mt_framework_lmt(bpy.types.Operator, ExportHelper):
         if arm is None:
             self.report({"ERROR"}, "Select an armature before exporting LMT.")
             return {"CANCELLED"}
+        selected_names = [pb.name for pb in arm.pose.bones if pb.bone.select]
+        if self.selected_bones_only and not selected_names:
+            self.report({"ERROR"}, "Select the edited bone(s) in Pose Mode before exporting.")
+            return {"CANCELLED"}
         try:
             from .lmt_export import export_lmt
-            count = export_lmt(self.filepath, arm, context.scene)
+            count = export_lmt(
+                self.filepath, arm, context.scene,
+                source_lmt=bpy.path.abspath(self.source_lmt),
+                slot_index=self.slot_index,
+                x64=self.arch_64bit,
+                selected_bones=selected_names if self.selected_bones_only else None,
+            )
         except Exception as exc:
             self.report({"ERROR"}, "LMT export failed: %s" % exc)
             import traceback
             traceback.print_exc()
             return {"CANCELLED"}
-        self.report({"INFO"}, "Exported LMT animation (%d bone tracks)." % count)
+        self.report({"INFO"}, "Patched source LMT in place (%d track(s) updated)." % count)
         return {"FINISHED"}
 
 
