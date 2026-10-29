@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Conservative in-place MT Framework LMT slot patcher.
+"""MT Framework LMT replacement exporter.
 
-Only edited track definitions are changed. New track buffers are appended to
-an otherwise byte-for-byte copy of the source file. No slot headers, existing
-buffers, bounds blocks, or unrelated slot pointers are compacted or relocated.
-Supported edited tracks use native-compatible quaternion/vector codecs; root translation uses Type 4 + Bounds.
+Replacement Actions can have a different frame count and LoopFrame from the
+original destination slot. Split pre-loop/loop Actions are reassembled into one
+LMT animation. Existing track storage is reused and only size growth is inserted,
+with known absolute pointers updated to avoid duplicating every replaced buffer.
 """
 import os
 import struct
@@ -227,36 +227,436 @@ def _encode_root_motion_position(values, loop_frame):
     return bytes(buffer), bounds_data, reference
 
 
-def _sample_track(scene, arm, pb, usage, frame_count, frame_start):
-    action = arm.animation_data.action if arm.animation_data else None
+def _sample_track(scene, arm, pb, usage, frame_count, frame_start,
+                  action_override=None):
+    """Sample a pose-bone channel from the active Action or an override Action."""
+    if arm.animation_data is None:
+        raise ValueError("The target armature has no animation data")
+    original_action = arm.animation_data.action
+    changed_action = action_override is not None and action_override != original_action
+    if changed_action:
+        arm.animation_data.action = action_override
     vals = []
     prev_q = None
-    for i in range(frame_count):
-        scene.frame_set(frame_start + i)
-        # force dependency graph evaluation before reading pose values
+    try:
         try:
             bpy.context.view_layer.update()
         except Exception:
             pass
-        if usage in (0, 3):
-            q = pb.rotation_quaternion.copy().normalized()
-            is_root = (pb.name == arm.get("mtf_game_root_bone") or
-                       int(pb.bone.get("mtf_index", -1)) == 255)
-            # The importer applies root-controller conversion to Usage 3
-            # tracks as well as BoneID 255, so export must invert it for both.
-            q = _q_to_mt(q, is_root or usage == 3)
-            if prev_q is not None and prev_q.dot(q) < 0:
-                q.negate()
-            prev_q = q.copy()
-            vals.append(q)
-        elif usage in (1, 4):
-            loc = pb.location.copy()
-            is_root = (pb.name == arm.get("mtf_game_root_bone") or
-                       int(pb.bone.get("mtf_index", -1)) == 255)
-            vals.append(_vector_to_mt(arm, pb, loc, is_root))
-        elif usage == 2:
-            vals.append(pb.scale.copy())
+        for i in range(frame_count):
+            scene.frame_set(frame_start + i)
+            # Force dependency graph evaluation before reading pose values.
+            try:
+                bpy.context.view_layer.update()
+            except Exception:
+                pass
+            if usage in (0, 3):
+                q = pb.rotation_quaternion.copy().normalized()
+                is_root = (pb.name == arm.get("mtf_game_root_bone") or
+                           int(pb.bone.get("mtf_index", -1)) == 255)
+                # The importer applies root-controller conversion to Usage 3
+                # tracks as well as BoneID 255, so export must invert it for both.
+                q = _q_to_mt(q, is_root or usage == 3)
+                if prev_q is not None and prev_q.dot(q) < 0:
+                    q.negate()
+                prev_q = q.copy()
+                vals.append(q)
+            elif usage in (1, 4):
+                loc = pb.location.copy()
+                is_root = (pb.name == arm.get("mtf_game_root_bone") or
+                           int(pb.bone.get("mtf_index", -1)) == 255)
+                vals.append(_vector_to_mt(arm, pb, loc, is_root))
+            elif usage == 2:
+                vals.append(pb.scale.copy())
+    finally:
+        if changed_action:
+            arm.animation_data.action = original_action
+            try:
+                bpy.context.view_layer.update()
+            except Exception:
+                pass
     return vals
+
+
+def _action_frame_info(action):
+    """Return (frame_count, first_frame) for an Action's current keyed range."""
+    if action is None:
+        return 1, 0
+    try:
+        frame_range = action.frame_range
+        start = int(round(frame_range[0]))
+        end = int(round(frame_range[1]))
+    except Exception:
+        start = int(round(getattr(action, "frame_start", 0)))
+        end = int(round(getattr(action, "frame_end", start)))
+    return max(1, end - start + 1), start
+
+
+def _split_loop_target(target_action, animation_id, active_action):
+    """Resolve a split pre-loop/loop Action pair without constraining it to the
+    destination slot's old frame count or LoopFrame.
+
+    MT Framework stores the pair as one LMT animation. The selected Action is
+    the phase being edited; its companion contributes the other phase. The new
+    LMT frame count and loop pivot are calculated from these two Actions.
+    """
+    if target_action is None:
+        return None
+    try:
+        target_id = int(target_action.get("mtf_animation_index", -1))
+    except (TypeError, ValueError):
+        return None
+    if target_id != int(animation_id):
+        raise ValueError(
+            "Selected Action '%s' maps to animation ID %d, not target ID %d. "
+            "Refresh the animation list and choose the correct target."
+            % (target_action.name, target_id, int(animation_id)))
+
+    target_is_loop = bool(target_action.get("mtf_is_loop", False))
+    target_is_full_loop = bool(target_action.get("mtf_full_loop", False))
+    if target_is_full_loop:
+        return None
+
+    if target_is_loop:
+        try:
+            metadata_loop_frame = int(target_action.get("mtf_source_loop_frame", 0) or 0)
+        except (TypeError, ValueError):
+            metadata_loop_frame = 0
+    else:
+        try:
+            metadata_loop_frame = int(target_action.get("mtf_loop_frame", 0) or 0)
+        except (TypeError, ValueError):
+            metadata_loop_frame = 0
+
+    is_split_segment = metadata_loop_frame > 0 and (
+        target_is_loop or int(target_action.get("mtf_loop_frame", 0) or 0) > 0
+    )
+    if not is_split_segment:
+        return None
+
+    if target_is_loop:
+        companion_name = str(target_action.get("mtf_source_action", ""))
+        companion = bpy.data.actions.get(companion_name) if companion_name else None
+    else:
+        companion = None
+        for candidate in bpy.data.actions:
+            if candidate == target_action:
+                continue
+            try:
+                candidate_id = int(candidate.get("mtf_animation_index", -1))
+            except (TypeError, ValueError):
+                continue
+            if (
+                candidate_id == target_id
+                and bool(candidate.get("mtf_is_loop", False))
+                and not bool(candidate.get("mtf_full_loop", False))
+                and str(candidate.get("mtf_source_action", "")) == target_action.name
+            ):
+                companion = candidate
+                break
+
+    if companion is None:
+        phase = "loop" if target_is_loop else "pre-loop"
+        other = "pre-loop" if target_is_loop else "loop"
+        raise ValueError(
+            "Cannot export the combined animation for '%s': its companion %s Action is missing. "
+            "Keep both Actions imported, then export again."
+            % (target_action.name, other))
+    try:
+        if int(companion.get("mtf_animation_index", -1)) != target_id:
+            raise ValueError("The selected Action's companion maps to a different LMT animation ID")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("The selected Action's companion metadata is invalid") from exc
+
+    active_count, active_start = _action_frame_info(active_action)
+    companion_count, companion_start = _action_frame_info(companion)
+    if target_is_loop:
+        pre_loop_count = companion_count
+        loop_count = active_count
+    else:
+        pre_loop_count = active_count
+        loop_count = companion_count
+    total_count = pre_loop_count + loop_count
+    if total_count <= 0 or total_count > 100000:
+        raise ValueError("The combined pre-loop/loop animation has an invalid frame count")
+    return {
+        "target_is_loop": target_is_loop,
+        "companion_action": companion,
+        "companion_start": companion_start,
+        "frame_count": total_count,
+        "loop_frame": pre_loop_count,
+        "active_start": active_start,
+    }
+
+
+def _write_lmt_updates(filepath, source, version, slot_count, offsets, target_slot,
+                       target_defs_offset, target_track_count, updates,
+                       frame_count, loop_frame):
+    """Patch updated track buffers while reusing their old storage where possible.
+
+    When a replacement buffer is longer than its original buffer, only the
+    additional bytes are inserted at the end of that buffer. All known absolute
+    LMT pointers (slot headers, definition tables, track buffers and bounds) are
+    adjusted. This prevents each export from appending a second full copy of
+    every edited track buffer to the end of the file.
+    """
+    def_size = 36 if version > 55 else 32
+    populated = [(i, off) for i, off in enumerate(offsets) if off]
+    slots = []
+    track_records = []
+    definition_ranges = []
+    header_end = max((off + 0x40 for _, off in populated), default=0)
+
+    for physical_slot, slot_offset in populated:
+        if slot_offset + 16 > len(source):
+            raise ValueError("Slot %d header is outside the source LMT" % physical_slot)
+        defs_offset, track_count, slot_frames, slot_loop = struct.unpack_from(
+            "<IIIi", source, slot_offset)
+        if (not track_count or defs_offset < 8
+                or defs_offset + track_count * def_size > len(source)):
+            raise ValueError("Slot %d has an invalid track-definition table" % physical_slot)
+        definition_ranges.append((defs_offset, defs_offset + track_count * def_size))
+        slots.append({
+            "physical_slot": physical_slot,
+            "slot_offset": slot_offset,
+            "defs_offset": defs_offset,
+            "track_count": track_count,
+            "frames": slot_frames,
+            "loop": slot_loop,
+        })
+        for index in range(track_count):
+            def_pos = defs_offset + index * def_size
+            raw = source[def_pos:def_pos + def_size]
+            if len(raw) != def_size:
+                raise ValueError("Track definition is truncated in slot %d" % physical_slot)
+            size, buffer_offset = struct.unpack_from("<II", raw, 8)
+            bounds_offset = struct.unpack_from("<I", raw, 32)[0] if version > 55 else 0
+            if size and (buffer_offset < 8 or buffer_offset + size > len(source)):
+                raise ValueError("Track buffer in slot %d points outside the source LMT" % physical_slot)
+            if bounds_offset and (bounds_offset < 8 or bounds_offset + 32 > len(source)):
+                raise ValueError("Track bounds in slot %d point outside the source LMT" % physical_slot)
+            track_records.append({
+                "physical_slot": physical_slot,
+                "index": index,
+                "def_pos": def_pos,
+                "size": size,
+                "buffer_offset": buffer_offset,
+                "bounds_offset": bounds_offset,
+            })
+
+    target_slot_info = next((item for item in slots if item["physical_slot"] == target_slot), None)
+    if target_slot_info is None:
+        raise ValueError("Target LMT slot %d is empty" % target_slot)
+    if target_slot_info["defs_offset"] != target_defs_offset:
+        raise ValueError("Target LMT layout changed while export was running")
+
+    # Some LMTs reuse one track-definition table for multiple animation slots.
+    # In that case a dict keyed only by definition address assigns the record to
+    # whichever slot was visited last, causing a false "no longer maps" error.
+    # More importantly, modifying that shared table/buffer in place would alter
+    # the other animation too. Use copy-on-write for the selected slot: duplicate
+    # only its definition table and write the changed track buffers at the end.
+    # This preserves all other slots and avoids shifting/duplicating the whole LMT.
+    target_defs_start_for_overlap = int(target_slot_info["defs_offset"])
+    target_defs_end_for_overlap = (
+        target_defs_start_for_overlap + int(target_slot_info["track_count"]) * def_size)
+    shared_definition_slots = []
+    for item in slots:
+        if item["physical_slot"] == target_slot:
+            continue
+        other_start = int(item["defs_offset"])
+        other_end = other_start + int(item["track_count"]) * def_size
+        if other_start < target_defs_end_for_overlap and target_defs_start_for_overlap < other_end:
+            shared_definition_slots.append(item)
+    if shared_definition_slots:
+        target_defs_start = int(target_slot_info["defs_offset"])
+        target_defs_end = target_defs_start + int(target_slot_info["track_count"]) * def_size
+        if target_defs_start < 8 or target_defs_end > len(source):
+            raise ValueError("Shared target track-definition table is outside the source LMT")
+
+        cloned_defs = bytearray(source[target_defs_start:target_defs_end])
+        used_def_positions = set()
+        out = bytearray(source)
+        for upd in updates:
+            def_pos = int(upd["def_pos"])
+            relative = def_pos - target_defs_start
+            if relative < 0 or relative >= len(cloned_defs) or relative % def_size:
+                raise ValueError(
+                    "Updated track definition 0x%X is outside the selected LMT slot's table"
+                    % def_pos)
+            if relative in used_def_positions:
+                raise ValueError("Duplicate track update was generated for one LMT definition")
+            used_def_positions.add(relative)
+
+            # Append a private sample buffer; never overwrite a buffer that may
+            # also be referenced by another slot using the shared definition.
+            while len(out) % 4:
+                out.append(0)
+            new_buffer_offset = len(out)
+            buffer = bytes(upd["buffer"])
+            out.extend(buffer)
+
+            bounds_offset = struct.unpack_from("<I", cloned_defs, relative + 32)[0] if version > 55 else 0
+            bounds_data = upd.get("bounds_data")
+            if bounds_data:
+                while len(out) % 4:
+                    out.append(0)
+                bounds_offset = len(out)
+                out.extend(bytes(bounds_data))
+
+            tr = upd["track"]
+            ref = upd["ref"]
+            if version > 55:
+                new_def = struct.pack(
+                    "<4BfII4fI", upd["type"], upd["usage"], tr["joint"], tr["bone"],
+                    tr["weight"], len(buffer), new_buffer_offset, *ref, bounds_offset)
+            else:
+                new_def = struct.pack(
+                    "<4BfII4f", upd["type"], upd["usage"], tr["joint"], tr["bone"],
+                    tr["weight"], len(buffer), new_buffer_offset, *ref)
+            if len(new_def) != def_size:
+                raise AssertionError("Internal track-definition size mismatch")
+            cloned_defs[relative:relative + def_size] = new_def
+
+        while len(out) % 4:
+            out.append(0)
+        cloned_defs_offset = len(out)
+        out.extend(cloned_defs)
+        struct.pack_into(
+            "<IIIi", out, target_slot_info["slot_offset"],
+            cloned_defs_offset, target_slot_info["track_count"], int(frame_count), int(loop_frame))
+        with open(filepath, "wb") as fh:
+            fh.write(out)
+        return len(updates)
+
+    records_by_def = {record["def_pos"]: record for record in track_records}
+    insertions = []
+    updated_by_def = {}
+    for upd in updates:
+        def_pos = upd["def_pos"]
+        record = records_by_def.get(def_pos)
+        if record is None or record["physical_slot"] != target_slot:
+            raise ValueError("Updated track no longer maps to the selected LMT slot")
+        if def_pos in updated_by_def:
+            raise ValueError("Duplicate track update was generated for one LMT definition")
+        updated_by_def[def_pos] = upd
+        old_size = int(record["size"])
+        old_offset = int(record["buffer_offset"])
+        new_size = len(upd["buffer"])
+        if old_size > 0 and new_size > old_size:
+            insertions.append((old_offset + old_size, new_size - old_size))
+
+    insertion_points = [pos for pos, _ in insertions]
+    if len(insertion_points) != len(set(insertion_points)):
+        raise ValueError("Source LMT has overlapping/aliased track buffers; safe resizing was cancelled")
+    for insert_at, _delta in insertions:
+        if insert_at < header_end:
+            raise ValueError("Track buffer overlaps the LMT slot-header area; safe resizing was cancelled")
+        for start, end in definition_ranges:
+            if start < insert_at < end:
+                raise ValueError("Track buffer overlaps a definition table; safe resizing was cancelled")
+        for record in track_records:
+            start = record["buffer_offset"]
+            end = start + record["size"]
+            if record["size"] and start < insert_at < end:
+                raise ValueError("Source LMT contains overlapping track buffers; safe resizing was cancelled")
+            bounds = record["bounds_offset"]
+            if bounds and bounds < insert_at < bounds + 32:
+                raise ValueError("Track buffer overlaps a bounds block; safe resizing was cancelled")
+
+    out = bytearray(source)
+    # Work from high offsets to low offsets so each insertion coordinate still
+    # refers to the original source file.
+    for insert_at, delta in sorted(insertions, reverse=True):
+        out[insert_at:insert_at] = b"\0" * delta
+
+    def remap_offset(value):
+        value = int(value or 0)
+        if value <= 0:
+            return value
+        return value + sum(delta for insert_at, delta in insertions if insert_at <= value)
+
+    # If a source track has no original storage, append only that new buffer.
+    appended_buffer_offsets = {}
+    for upd in updates:
+        record = records_by_def[upd["def_pos"]]
+        if record["size"] == 0:
+            while len(out) % 4:
+                out.append(0)
+            appended_buffer_offsets[upd["def_pos"]] = len(out)
+            out.extend(upd["buffer"])
+
+    appended_bounds_offsets = {}
+    for upd in updates:
+        if not upd.get("bounds_data"):
+            continue
+        record = records_by_def[upd["def_pos"]]
+        if not record["bounds_offset"]:
+            while len(out) % 4:
+                out.append(0)
+            appended_bounds_offsets[upd["def_pos"]] = len(out)
+            out.extend(upd["bounds_data"])
+
+    # Remap every known absolute pointer so other animation slots continue to
+    # point to their original definitions, buffers and quantization bounds.
+    for item in slots:
+        slot_offset = item["slot_offset"]
+        mapped_defs = remap_offset(item["defs_offset"])
+        struct.pack_into("<I", out, slot_offset, mapped_defs)
+
+    for record in track_records:
+        mapped_def = remap_offset(record["def_pos"])
+        mapped_buffer = remap_offset(record["buffer_offset"])
+        struct.pack_into("<I", out, mapped_def + 12, mapped_buffer)
+        if version > 55:
+            mapped_bounds = remap_offset(record["bounds_offset"])
+            struct.pack_into("<I", out, mapped_def + 32, mapped_bounds)
+
+    # Replace each updated buffer at its original location (extended in place
+    # when needed), then rewrite its definition with the exact new size.
+    for upd in updates:
+        tr = upd["track"]
+        def_pos = upd["def_pos"]
+        record = records_by_def[def_pos]
+        if record["size"] == 0:
+            new_buffer_offset = appended_buffer_offsets[def_pos]
+        else:
+            new_buffer_offset = remap_offset(record["buffer_offset"])
+        buffer = upd["buffer"]
+        out[new_buffer_offset:new_buffer_offset + len(buffer)] = buffer
+
+        bounds_offset = 0
+        bounds_data = upd.get("bounds_data")
+        if bounds_data:
+            if record["bounds_offset"]:
+                bounds_offset = remap_offset(record["bounds_offset"])
+            else:
+                bounds_offset = appended_bounds_offsets[def_pos]
+            out[bounds_offset:bounds_offset + len(bounds_data)] = bounds_data
+
+        ref = upd["ref"]
+        if version > 55:
+            new_def = struct.pack(
+                "<4BfII4fI", upd["type"], upd["usage"], tr["joint"], tr["bone"],
+                tr["weight"], len(buffer), new_buffer_offset, *ref, bounds_offset)
+        else:
+            new_def = struct.pack(
+                "<4BfII4f", upd["type"], upd["usage"], tr["joint"], tr["bone"],
+                tr["weight"], len(buffer), new_buffer_offset, *ref)
+        if len(new_def) != def_size:
+            raise AssertionError("Internal track-definition size mismatch")
+        mapped_def_pos = remap_offset(def_pos)
+        out[mapped_def_pos:mapped_def_pos + def_size] = new_def
+
+    # Frame count and LoopFrame belong to the exported Action, not the old slot.
+    struct.pack_into(
+        "<IIIi", out, target_slot_info["slot_offset"],
+        remap_offset(target_slot_info["defs_offset"]),
+        target_slot_info["track_count"], int(frame_count), int(loop_frame))
+
+    with open(filepath, "wb") as fh:
+        fh.write(out)
+    return len(updates)
 
 
 
@@ -285,13 +685,13 @@ def _resolve_animation_id(source_lmt, animation_id):
 
 
 def export_lmt(filepath, arm_obj, scene, source_lmt, slot_index, x64=False,
-               selected_bones=None):
-    """Patch edited tracks in place while preserving the source LMT container.
+               selected_bones=None, target_action_name=None):
+    """Replace one animation in a copy of a native-layout LMT.
 
-    The source must have the game's native 0x40-stride slot-header layout.
-    Compact/repacked containers are deliberately rejected: earlier tests showed
-    that moving every slot's definitions and buffers caused severe in-game lag.
-    Only changed definition records and newly appended buffers are written.
+    The replacement may have a different frame count and LoopFrame from the
+    destination slot. Split pre-loop/loop Actions are sampled as one animation.
+    Compact/repacked containers remain deliberately rejected because relocating
+    their overall slot layout has not been validated against the game parser.
     """
     if not source_lmt or not os.path.isfile(source_lmt):
         raise ValueError("Select a valid game-native LMT as Source LMT")
@@ -304,10 +704,37 @@ def export_lmt(filepath, arm_obj, scene, source_lmt, slot_index, x64=False,
     animation_id = int(slot_index)
     if animation_id < 0:
         raise ValueError("Animation ID must be 0 or greater")
+    target_action = bpy.data.actions.get(target_action_name) if target_action_name else None
+    if target_action_name and target_action is None:
+        raise ValueError("Selected target Action '%s' no longer exists. Reopen Export LMT and choose it again." % target_action_name)
+    if target_action is None:
+        raise ValueError("Choose a named target animation in the Export LMT list")
+    try:
+        target_action_id = int(target_action.get("mtf_animation_index", -1))
+    except (TypeError, ValueError):
+        target_action_id = -1
+    if target_action_id != animation_id:
+        raise ValueError("Selected Action '%s' does not have valid MT Framework animation metadata" % target_action.name)
     # UI IDs are dense over populated animations; empty physical LMT slots are skipped.
     physical_slot = _resolve_animation_id(source_lmt, animation_id)
-    source, version, slot_count, offsets, slot, frame_count, loop_frame, selected_defs = _read_source(
+    source, version, slot_count, offsets, slot, source_frame_count, source_loop_frame, selected_defs = _read_source(
         source_lmt, physical_slot, x64=x64)
+    split_target = _split_loop_target(target_action, animation_id, action)
+    if split_target is not None:
+        frame_count = int(split_target["frame_count"])
+        loop_frame = int(split_target["loop_frame"])
+        frame_start = int(split_target["active_start"])
+    else:
+        frame_count, frame_start = _action_frame_info(action)
+        if bool(target_action.get("mtf_full_loop", False)):
+            loop_frame = 0
+        else:
+            # A non-split Action without a loop marker is exported as a normal
+            # non-looping clip. The destination slot's previous LoopFrame is not
+            # allowed to constrain or silently change the replacement.
+            loop_frame = -1
+    if frame_count <= 0 or frame_count > 100000:
+        raise ValueError("Selected Action has an invalid frame count")
     if version <= 50:
         raise ValueError("Safe export currently requires LMT version 51 or newer")
     def_size = 36 if version > 55 else 32
@@ -329,13 +756,11 @@ def export_lmt(filepath, arm_obj, scene, source_lmt, slot_index, x64=False,
             raise ValueError("Slot %d has an invalid track-definition table" % source_slot)
         if slot_frames <= 0 or slot_frames > 100000:
             raise ValueError("Slot %d has an implausible frame count" % source_slot)
-        if source_slot == slot:
-            frame_count, loop_frame = slot_frames, slot_loop
 
     if slot not in [i for i, _ in populated]:
         raise ValueError("Target slot %d is empty" % slot)
     slot_offset = offsets[slot]
-    defs_offset, track_count, source_frame_count, source_loop_frame = struct.unpack_from(
+    defs_offset, track_count, original_slot_frames, original_slot_loop = struct.unpack_from(
         "<IIIi", source, slot_offset)
     tracks = []
     for index in range(track_count):
@@ -353,9 +778,8 @@ def export_lmt(filepath, arm_obj, scene, source_lmt, slot_index, x64=False,
                        "joint": joint, "bone": bone, "weight": weight,
                        "size": size, "offset": buf_off, "ref": ref, "bounds": bounds})
 
-    frame_count = max(1, min(int(source_frame_count), 100000))
-    frame_start = int(round(action.frame_range[0])) if hasattr(action, "frame_range") else int(round(action.frame_start))
-    frame_start = max(0, frame_start)
+    frame_count = max(1, min(int(frame_count), 100000))
+    frame_start = max(0, int(frame_start))
     selected_bones = None if selected_bones is None else set(selected_bones)
 
     # Refuse likely accidental whole-rig export. Presence of keyframes alone is
@@ -391,7 +815,38 @@ def export_lmt(filepath, arm_obj, scene, source_lmt, slot_index, x64=False,
             if not _action_has_curve(action, pb.name, usage):
                 continue
 
-            vals = _sample_track(scene, arm_obj, pb, usage, frame_count, frame_start)
+            if split_target is not None:
+                loop_split = int(split_target["loop_frame"])
+                companion_action = split_target["companion_action"]
+                if not _action_has_curve(companion_action, pb.name, usage):
+                    # Keep the old track only when this channel is absent from
+                    # the companion segment; never substitute a partial clip.
+                    continue
+                active_start = int(split_target["active_start"])
+                companion_start = int(split_target["companion_start"])
+                if split_target["target_is_loop"]:
+                    before = _sample_track(
+                        scene, arm_obj, pb, usage, loop_split, companion_start,
+                        action_override=companion_action)
+                    after = _sample_track(
+                        scene, arm_obj, pb, usage, frame_count - loop_split,
+                        active_start, action_override=action)
+                    vals = before + after
+                else:
+                    before = _sample_track(
+                        scene, arm_obj, pb, usage, loop_split, active_start,
+                        action_override=action)
+                    after = _sample_track(
+                        scene, arm_obj, pb, usage, frame_count - loop_split,
+                        companion_start, action_override=companion_action)
+                    vals = before + after
+                if usage in (0, 3):
+                    # Keep quaternion signs continuous across the spliced boundary.
+                    for value_index in range(1, len(vals)):
+                        if vals[value_index - 1].dot(vals[value_index]) < 0:
+                            vals[value_index].negate()
+            else:
+                vals = _sample_track(scene, arm_obj, pb, usage, frame_count, frame_start)
             if not vals:
                 continue
             bounds_data = None
@@ -412,7 +867,8 @@ def export_lmt(filepath, arm_obj, scene, source_lmt, slot_index, x64=False,
                 first = vals[0]
                 ref = (float(first.x), float(first.y), float(first.z), 0.0)
                 bt = 3
-            updates.append({"track": tr, "type": bt, "usage": usage, "buffer": buffer,
+            updates.append({"track": tr, "def_pos": defs_offset + tr["index"] * def_size,
+                            "type": bt, "usage": usage, "buffer": buffer,
                             "bounds_data": bounds_data, "ref": ref})
     finally:
         scene.frame_set(old_frame)
@@ -426,36 +882,7 @@ def export_lmt(filepath, arm_obj, scene, source_lmt, slot_index, x64=False,
                 % ", ".join(sorted(selected_bones)))
         raise ValueError("No supported keyed tracks found in the active Action")
 
-    out = bytearray(source)
-    for upd in updates:
-        tr = upd["track"]
-        buffer = upd["buffer"]
-        while len(out) % 4:
-            out.append(0)
-        new_buffer_offset = len(out)
-        out.extend(buffer)
-        bounds_offset = 0
-        bounds_data = upd.get("bounds_data")
-        if bounds_data:
-            while len(out) % 4:
-                out.append(0)
-            bounds_offset = len(out)
-            out.extend(bounds_data)
-        ref = upd["ref"]
-        if version > 55:
-            new_def = struct.pack(
-                "<4BfII4fI", upd["type"], upd["usage"], tr["joint"], tr["bone"],
-                tr["weight"], len(buffer), new_buffer_offset, *ref, bounds_offset)
-        else:
-            new_def = struct.pack(
-                "<4BfII4f", upd["type"], upd["usage"], tr["joint"], tr["bone"],
-                tr["weight"], len(buffer), new_buffer_offset, *ref)
-        if len(new_def) != def_size:
-            raise AssertionError("Internal track-definition size mismatch")
-        def_pos = defs_offset + tr["index"] * def_size
-        out[def_pos:def_pos + def_size] = new_def
-
-    with open(filepath, "wb") as fh:
-        fh.write(out)
-    return len(updates)
+    return _write_lmt_updates(
+        filepath, source, version, slot_count, offsets, slot, defs_offset, track_count,
+        updates, frame_count, loop_frame)
 
