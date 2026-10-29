@@ -636,7 +636,7 @@ class EXPORT_OT_mt_framework_lmt(bpy.types.Operator, ExportHelper):
 
     def draw(self, context):
         layout = self.layout
-        layout.label(text="Replace one animation in an existing LMT.")
+        layout.label(text="Replace one animation in a copy of an existing LMT.")
         layout.prop(context.window_manager, "mtf_lmt_source_path", text="Source LMT")
         layout.operator(
             "wm.mtf_lmt_use_selected_file",
@@ -647,6 +647,9 @@ class EXPORT_OT_mt_framework_lmt(bpy.types.Operator, ExportHelper):
         layout.prop(self, "slot_index")
         layout.prop(self, "arch_64bit")
         layout.prop(self, "selected_bones_only")
+        layout.separator()
+        layout.label(text="Output must differ from source; original is never overwritten.", icon="INFO")
+        layout.label(text="Native LMT v51+ layout; 64-bit layouts are not supported.")
         arm = _active_armature(context)
         if arm is None:
             layout.label(text="Select an armature first", icon="ERROR")
@@ -695,7 +698,7 @@ class EXPORT_OT_mt_framework_lmt(bpy.types.Operator, ExportHelper):
             import traceback
             traceback.print_exc()
             return {"CANCELLED"}
-        self.report({"INFO"}, "Patched source LMT in place (%d track(s) updated)." % count)
+        self.report({"INFO"}, "Exported LMT copy; %d track(s) updated." % count)
         return {"FINISHED"}
 
 

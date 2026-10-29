@@ -125,9 +125,11 @@ def _rotation_from_mt_quaternion(q):
 
 def _root_controller_rotation(q):
     """
-    Equivalent of the original MaxScript root rotation conversion:
+    Convert the root rotation into Blender's coordinate basis while keeping
+    bone255 upright in the MT Framework -> Blender convention (+Z up, -Y front).
 
-        inverse((b.value as matrix3) * MTFCormat).rotation
+    Root track rotation is the only rotation given this basis conversion.
+    Child-bone rotations remain parent-local and must not be converted again.
     """
 
     bmat = _rotation_from_mt_quaternion(q)
@@ -137,12 +139,17 @@ def _root_controller_rotation(q):
         @ MTFCORMAT_4.inverted()
     )
 
-    return out.to_quaternion().normalized()
+    basis = MTFCORMAT_4.to_3x3()
+    aligned = basis @ out.to_3x3()
+
+    return aligned.to_quaternion().normalized()
 
 
 def _local_controller_rotation(q):
     """
-    Child-bone rotations are already parent-local.
+    Child-bone rotations are already parent-local in the decoded LMT data.
+    Do not apply the global coordinate-basis conversion to each child; doing so
+    twists limbs away from the animation's original pose.
     """
 
     return q.normalized()

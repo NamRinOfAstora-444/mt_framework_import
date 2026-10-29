@@ -137,9 +137,14 @@ def _action_has_curve(action, bone_name, usage):
 def _q_to_mt(q, is_root):
     q = q.copy().normalized()
     if is_root:
-        # Inverse of lmt_import._root_controller_rotation:
-        # blender = inverse(mt_matrix @ MTFCORMAT_4)
-        return (MTFCORMAT_4.inverted() @ q.to_matrix().to_4x4().inverted()).to_quaternion().normalized()
+        # Exact inverse of the confirmed import-side root alignment:
+        # q_blender = C @ inverse(q_mt) @ inverse(C)
+        # Therefore q_mt = inverse(C) @ inverse(q_blender) @ C.
+        c = MTFCORMAT_4
+        inverse = c.inverted() @ q.to_matrix().to_4x4().inverted() @ c
+        return inverse.to_quaternion().normalized()
+    # Child rotations are imported as parent-local quaternions without a
+    # second global-basis conversion, so export preserves them as-is.
     return q
 
 
@@ -237,7 +242,9 @@ def _sample_track(scene, arm, pb, usage, frame_count, frame_start):
             q = pb.rotation_quaternion.copy().normalized()
             is_root = (pb.name == arm.get("mtf_game_root_bone") or
                        int(pb.bone.get("mtf_index", -1)) == 255)
-            q = _q_to_mt(q, is_root)
+            # The importer applies root-controller conversion to Usage 3
+            # tracks as well as BoneID 255, so export must invert it for both.
+            q = _q_to_mt(q, is_root or usage == 3)
             if prev_q is not None and prev_q.dot(q) < 0:
                 q.negate()
             prev_q = q.copy()
