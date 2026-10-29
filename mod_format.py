@@ -414,7 +414,10 @@ class MODMeshPartv3:
         fl.read_short(signed=False)
         self.vertexcount = fl.read_short(signed=False)
         self.id = fl.read_short(signed=False)
-        fl.read_short(signed=False)
+        # MOD3 v237 stores a direct material index in this descriptor field.
+        # Keep it on the part because the common import path uses part.material
+        # after mesh decoding (even when texture/material import is disabled).
+        self.material = fl.read_short(signed=False)
         self.LOD = fl.read_long(signed=False)
         fl.read_short(signed=False)
         self.blocksize = fl.read_byte(signed=False)

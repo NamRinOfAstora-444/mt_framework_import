@@ -368,7 +368,12 @@ def mod_runtime(reader, options, context):
     # rendered dark + backface-culled inside build_materials.
     materials = {}
     if options.get("import_textures"):
-        used = set(p.material // 16 for p in parts.parts)
+        # MOD3 v237 stores a direct material index; older MOD formats store
+        # the index in 16-byte units.
+        used = set(
+            p.material if header.Version == 237 else p.material // 16
+            for p in parts.parts
+        )
         mod_mat_names = _read_mod_material_names(reader, header)
         try:
             materials = build_materials(
@@ -415,7 +420,10 @@ def mod_runtime(reader, options, context):
 
         # Assign material by index (part.material // 16). The material already
         # carries its texture and, for "ol_*" names, its dark outline shading.
-        mat = materials.get(part.material // 16)
+        material_index = (
+            part.material if header.Version == 237 else part.material // 16
+        )
+        mat = materials.get(material_index)
         if mat is not None:
             obj.data.materials.append(mat)
 
