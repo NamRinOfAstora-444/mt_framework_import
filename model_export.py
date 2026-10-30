@@ -772,16 +772,36 @@ def _half(value):
 
 
 def _write_v212_skinned_vertex(vertex, mins, scale):
-    """Write the GU-native SkinnedCharacter011[U1NS] (0x14d40022) layout.
+    """Write one GU-native SkinnedCharacter011[U1NS] (0x14d40022) vertex.
 
-    Layout is 28 bytes as observed in MHGU v212 files:
-      int16x3 position, int16 weight0, int8x3 normal + pad,
-      4-byte tangent, uint8x4 bone indices, half2 UV1, half2 weight1/weight2.
-    The implicit fourth weight is decoded as 1 - weight0 - weight1 - weight2.
+    Position shorts are decoded as (short / 32767) * vtbuffscale + bbmin.
+    Therefore each axis must be quantized against its own scale component.
+    Using one scalar for all axes can saturate a long axis and visibly squash
+    part of a model (the previous writer clipped 387 Z coordinates in the
+    supplied test MOD).
     """
     p = vertex["position"]
-    normalized = [0.0 if scale <= 1.0e-12 else (float(p[i]) - mins[i]) / scale for i in range(3)]
-    positions = [max(-32767, min(32767, int(round(v * 32767.0)))) for v in normalized]
+    if isinstance(scale, (int, float)):
+        scales = (float(scale),) * 3
+    else:
+        scales = tuple(float(v) for v in scale)
+    if len(scales) != 3:
+        raise ModelExportError("MHGU v212 position scale must contain three axis values.")
+
+    normalized = []
+    positions = []
+    for axis in range(3):
+        axis_scale = scales[axis]
+        q = 0.0 if axis_scale <= 1.0e-12 else (float(p[axis]) - float(mins[axis])) / axis_scale
+        # Bounds are computed from the same exported vertices. Allow only tiny
+        # floating-point drift; never silently clamp a real coordinate overflow.
+        if q < -1.0e-5 or q > 1.00001:
+            raise ModelExportError(
+                "MHGU v212 %s position is outside its quantization bounds (%.6f)." %
+                ("XYZ"[axis], q))
+        q = max(0.0, min(1.0, q))
+        normalized.append(q)
+        positions.append(max(0, min(32767, int(round(q * 32767.0)))))
 
     influences = sorted(vertex["weights"], key=lambda x: x[1], reverse=True)[:4]
     if not influences:
@@ -868,6 +888,13 @@ def _v212_position_scale_from_armature(armature, fallback_scale):
 def _build_v212_skeleton(armature, bones, bone_index_map, bbox_min, position_scale):
     import mathutils
     count = len(bones)
+    if isinstance(position_scale, (int, float)):
+        position_scales = (float(position_scale),) * 3
+    else:
+        position_scales = tuple(float(v) for v in position_scale)
+    if len(position_scales) != 3 or any(not math.isfinite(v) or v <= 1.0e-12 for v in position_scales):
+        raise ModelExportError("MHGU v212 requires three finite, positive position scales.")
+    position_scale_max = max(position_scales)
     c = mathutils.Matrix((
         (1.0, 0.0, 0.0, 0.0),
         (0.0, 0.0, -1.0, 0.0),
@@ -875,7 +902,7 @@ def _build_v212_skeleton(armature, bones, bone_index_map, bbox_min, position_sca
         (0.0, 0.0, 0.0, 1.0),
     ))
     c_inv = c.inverted()
-    scale_matrix = mathutils.Matrix.Diagonal((position_scale, position_scale, position_scale, 1.0))
+    scale_matrix = mathutils.Matrix.Diagonal((*position_scales, 1.0))
     bone_by_name = {bone.name: new_index for new_index, (_, bone) in enumerate(bones)}
     world_engine = []
     local_engine = []
@@ -903,9 +930,9 @@ def _build_v212_skeleton(armature, bones, bone_index_map, bbox_min, position_sca
             # local[0].translation. Keep that equation exact even when the root
             # bone has a non-zero rest translation.
             absolute = mathutils.Matrix.Identity(4)
-            absolute[0][0] = position_scale
-            absolute[1][1] = position_scale
-            absolute[2][2] = position_scale
+            absolute[0][0] = position_scales[0]
+            absolute[1][1] = position_scales[1]
+            absolute[2][2] = position_scales[2]
             absolute.translation = mathutils.Vector(bbox_min) - local_engine[0].translation
         absolute_blob += _matrix_blob(absolute)
 
@@ -943,8 +970,8 @@ def _build_v212_skeleton(armature, bones, bone_index_map, bbox_min, position_sca
                 # the centerline were incorrectly treated as center bones when the
                 # model scale made threshold > 3. This produced wrong mirror indices
                 # for the MHGU sample (bone indices 11 and 15).
-                centerline_threshold = max(0.025, float(position_scale) * 0.005)
-                pair_distance_threshold = max(0.025, float(position_scale) * 0.05)
+                centerline_threshold = max(0.025, float(position_scale_max) * 0.005)
+                pair_distance_threshold = max(0.025, float(position_scale_max) * 0.05)
                 source_x = float(bone.head_local.x)
                 if abs(source_x) > centerline_threshold:
                     head = bone.head_local.copy(); head.x = -head.x
@@ -1058,18 +1085,19 @@ def _write_mod212_skinned(filepath, parts, material_names, vertex_ids, armature,
         raise ModelExportError("No exported vertices.")
     mins = tuple(min(p[i] for p in positions) for i in range(3))
     maxs = tuple(max(p[i] for p in positions) for i in range(3))
-    bounds_scale = max(maxs[i] - mins[i] for i in range(3))
-    if bounds_scale <= 1.0e-8:
-        bounds_scale = 1.0
-    # Imported MHGU armatures carry the original scale implicitly in the synthetic
-    # bone255 display length. Use it for both position quantization and skeleton
-    # absolute matrices. Deriving scale only from the visible mesh bounds is wrong
-    # when the importer has skipped source layouts that it cannot decode: the model
-    # still imports in Blender but the game deforms/offsets it when exported.
-    position_scale = _v212_position_scale_from_armature(armature, bounds_scale)
+    # Quantize each axis against its own exported extent. The vertex decoder
+    # multiplies normalized signed-int16 positions by the three components of
+    # vtbuffscale; one uniform scale is not sufficient for elongated models and
+    # can clip coordinates on the longest axis. Using the actual exported bounds
+    # also supports arbitrary user edits without depending on bone255's display
+    # length (which only contains a scalar length and cannot recover XYZ scales).
+    position_scales = tuple(
+        (maxs[i] - mins[i]) if (maxs[i] - mins[i]) > 1.0e-8 else 1.0
+        for i in range(3)
+    )
 
     bone_blob, world_engine, remap_table = _build_v212_skeleton(
-        armature, bones, bone_index_map, mins, position_scale)
+        armature, bones, bone_index_map, mins, position_scales)
     if len(bone_blob) != len(bones) * 152 + 256:
         raise ModelExportError("Internal MOD v212 skeleton block size mismatch.")
 
@@ -1119,7 +1147,7 @@ def _write_mod212_skinned(filepath, parts, material_names, vertex_ids, armature,
             pts = part_bone_positions.get(bone_index) or [v["position"] for v in part["vertices"]]
             bound_blob += _weight_bound_record(bone_index, world_engine[bone_index], pts)
 
-        vb = b"".join(_write_v212_skinned_vertex(v, mins, position_scale) for v in part["vertices"])
+        vb = b"".join(_write_v212_skinned_vertex(v, mins, position_scales) for v in part["vertices"])
         if len(vb) != len(part["vertices"]) * 28:
             raise ModelExportError("Internal MHGU-native stride-28 vertex mismatch in %s." % part["name"])
         indices = _mod_faces(part, 212, vertex_sub=0)

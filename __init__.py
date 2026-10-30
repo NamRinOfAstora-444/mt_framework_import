@@ -35,7 +35,7 @@ against real game files.
 bl_info = {
     "name": "MT Framework (MOD/LMT) Importer",
     "author": "axestyra",
-    "version": (0, 21, 16),
+    "version": (0, 21, 17),
     "blender": (3, 0, 0),
     "location": "File > Import > MT Framework Model / Animation",
     "description": "Import/export MT Framework LMT with native BoneID 255 root-motion vector encoding.",
