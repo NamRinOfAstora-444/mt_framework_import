@@ -480,6 +480,16 @@ def apply_animation(
 
     arm_obj.animation_data.action = action
 
+    # Record Action ownership so the searchable export UI cannot accidentally
+    # use a Player Action on a Palico rig (or vice versa). This metadata does
+    # not alter any pose channels, key values, transforms, or interpolation.
+    try:
+        action["mtf_armature_name"] = arm_obj.name
+        if getattr(arm_obj, "data", None) is not None:
+            action["mtf_armature_data_name"] = arm_obj.data.name
+    except Exception:
+        pass
+
     # Remove stale object-level root-motion channels from actions imported by
     # older builds. BoneID 255 is animated through its own pose-bone channels.
     _remove_object_root_motion_curves(action)

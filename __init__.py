@@ -35,7 +35,7 @@ against real game files.
 bl_info = {
     "name": "MT Framework (MOD/LMT) Importer",
     "author": "axestyra",
-    "version": (0, 21, 17),
+    "version": (0, 21, 27),
     "blender": (3, 0, 0),
     "location": "File > Import > MT Framework Model / Animation",
     "description": "Import/export MT Framework LMT with native BoneID 255 root-motion vector encoding.",
@@ -548,7 +548,7 @@ def menu_func_import(self, context):
 
 
 class MTF_LMT_AnimationItem(bpy.types.PropertyGroup):
-    """One named Blender Action that maps back to an imported LMT slot."""
+    """A named imported Action and the source LMT animation it replaces."""
     action_name: StringProperty(name="Action Name")
     animation_index: IntProperty(name="Animation ID", default=-1, min=-1)
     is_loop: BoolProperty(name="Loop Segment", default=False)
@@ -556,7 +556,7 @@ class MTF_LMT_AnimationItem(bpy.types.PropertyGroup):
 
 
 def _refresh_lmt_animation_items(context):
-    """Build the named replacement list from imported MT Framework Actions."""
+    """Refresh the searchable target list from imported MT Framework Actions."""
     wm = context.window_manager
     selected_name = None
     old_index = int(getattr(wm, "mtf_lmt_animation_index", 0))
@@ -564,34 +564,43 @@ def _refresh_lmt_animation_items(context):
     if old_items and 0 <= old_index < len(old_items):
         selected_name = old_items[old_index].action_name
 
+    target_armature = _active_armature(context)
+    target_armature_name = target_armature.name if target_armature is not None else ""
     actions = []
     for action in bpy.data.actions:
+        if bool(action.get("mtf_internal_source_companion", False)):
+            continue
+        owner_name = str(action.get("mtf_armature_name", "") or "")
+        # Keep legacy untagged Actions visible for compatibility, but never mix
+        # Actions explicitly tagged to a different rig.
+        if target_armature_name and owner_name and owner_name != target_armature_name:
+            continue
         try:
-            animation_index = int(action.get("mtf_animation_index", -1))
+            animation_id = int(action.get("mtf_animation_index", -1))
         except (TypeError, ValueError):
             continue
-        if animation_index < 0:
+        if animation_id < 0:
             continue
         is_loop = bool(action.get("mtf_is_loop", False))
         is_full_loop = bool(action.get("mtf_full_loop", False))
         try:
-            pre_loop_frame = int(action.get("mtf_loop_frame", 0) or 0)
-            source_loop_frame = int(action.get("mtf_source_loop_frame", 0) or 0)
+            pre_loop = int(action.get("mtf_loop_frame", 0) or 0)
+            source_loop = int(action.get("mtf_source_loop_frame", 0) or 0)
         except (TypeError, ValueError):
-            pre_loop_frame = source_loop_frame = 0
-        is_split_segment = not is_full_loop and (pre_loop_frame > 0 or (is_loop and source_loop_frame > 0))
-        actions.append((animation_index, action.name.casefold(), action.name, is_loop, is_split_segment))
-    actions.sort(key=lambda entry: (entry[0], entry[1]))
+            pre_loop = source_loop = 0
+        split = not is_full_loop and (pre_loop > 0 or (is_loop and source_loop > 0))
+        actions.append((animation_id, action.name.casefold(), action.name, is_loop, split))
 
+    actions.sort(key=lambda entry: (entry[0], entry[1]))
     items = wm.mtf_lmt_animation_items
     items.clear()
     selected_index = 0
-    for index, (animation_id, _sort_name, action_name, is_loop, is_split_segment) in enumerate(actions):
+    for index, (animation_id, _sort_name, action_name, is_loop, split) in enumerate(actions):
         item = items.add()
         item.action_name = action_name
         item.animation_index = animation_id
         item.is_loop = is_loop
-        item.is_split_segment = is_split_segment
+        item.is_split_segment = split
         if action_name == selected_name:
             selected_index = index
     wm.mtf_lmt_animation_index = selected_index if items else 0
@@ -599,14 +608,17 @@ def _refresh_lmt_animation_items(context):
 
 
 def _on_lmt_animation_search_changed(wm, context):
-    """Keep the active row on a visible result as the search text changes."""
     search = (wm.mtf_lmt_animation_search or "").casefold().strip()
     items = wm.mtf_lmt_animation_items
     current = int(wm.mtf_lmt_animation_index)
-    if 0 <= current < len(items) and search in items[current].action_name.casefold():
-        return
+    if 0 <= current < len(items):
+        current_item = items[current]
+        searchable = "%s %d" % (current_item.action_name, current_item.animation_index)
+        if search in searchable.casefold():
+            return
     for index, item in enumerate(items):
-        if not search or search in item.action_name.casefold():
+        searchable = "%s %d" % (item.action_name, item.animation_index)
+        if not search or search in searchable.casefold():
             wm.mtf_lmt_animation_index = index
             return
 
@@ -618,7 +630,8 @@ class UI_UL_mtf_lmt_animations(bpy.types.UIList):
         search = (context.window_manager.mtf_lmt_animation_search or "").casefold().strip()
         flags = []
         for item in items:
-            visible = not search or search in item.action_name.casefold()
+            searchable = "%s %d" % (item.action_name, item.animation_index)
+            visible = not search or search in searchable.casefold()
             flags.append(self.bitflag_filter_item if visible else 0)
         return flags, []
 
@@ -627,6 +640,8 @@ class UI_UL_mtf_lmt_animations(bpy.types.UIList):
         row = layout.row(align=True)
         row.label(text=item.action_name, icon="ACTION")
         row.label(text="ID %03d" % item.animation_index)
+        if item.is_split_segment:
+            row.label(text="LOOP" if item.is_loop else "PRE", icon="FILE_REFRESH")
 
 
 class IMPORT_OT_mt_framework_lmt(bpy.types.Operator, ImportHelper):
@@ -736,21 +751,25 @@ class EXPORT_OT_mt_framework_lmt(bpy.types.Operator, ExportHelper):
             icon="FILE_TICK",
         )
         layout.separator()
-        layout.label(text="Search by animation / Action name")
+        layout.label(text="Search by animation / Action name / ID")
+        arm_for_filter = _active_armature(context)
+        if arm_for_filter is not None:
+            layout.label(text="Actions tagged to: %s" % arm_for_filter.name, icon="ARMATURE_DATA")
         layout.prop(wm, "mtf_lmt_animation_search", text="", icon="VIEWZOOM")
         layout.template_list(
             "UI_UL_mtf_lmt_animations", "mtf_lmt_replace_targets",
             wm, "mtf_lmt_animation_items",
             wm, "mtf_lmt_animation_index",
-            rows=5,
+            rows=6,
         )
         items = wm.mtf_lmt_animation_items
-        target = None
-        target_index = int(wm.mtf_lmt_animation_index)
+        selected_index = int(wm.mtf_lmt_animation_index)
         search = (wm.mtf_lmt_animation_search or "").casefold().strip()
-        if 0 <= target_index < len(items):
-            candidate = items[target_index]
-            if not search or search in candidate.action_name.casefold():
+        target = None
+        if 0 <= selected_index < len(items):
+            candidate = items[selected_index]
+            searchable = "%s %d" % (candidate.action_name, candidate.animation_index)
+            if not search or search in searchable.casefold():
                 target = candidate
         if target is not None:
             layout.label(
@@ -759,7 +778,10 @@ class EXPORT_OT_mt_framework_lmt(bpy.types.Operator, ExportHelper):
                 icon="CHECKMARK",
             )
             if target.is_split_segment:
-                layout.label(text="The pre-loop and loop Actions will be combined into one LMT animation.", icon="INFO")
+                layout.label(
+                    text="PRE-LOOP + LOOP are merged into one LMT animation. This Action is one half of that pair.",
+                    icon="INFO",
+                )
         elif not items:
             layout.label(text="No imported LMT Actions found. Import the target LMT animations first.", icon="ERROR")
         else:
@@ -772,11 +794,8 @@ class EXPORT_OT_mt_framework_lmt(bpy.types.Operator, ExportHelper):
         arm = _active_armature(context)
         if arm is None:
             layout.label(text="Select an armature first", icon="ERROR")
-        elif not arm.animation_data or not arm.animation_data.action:
-            layout.label(text="Assign an active Action first", icon="ERROR")
         else:
-            layout.label(text="Edited Action: %s" % arm.animation_data.action.name,
-                         icon="ACTION")
+            layout.label(text="Armature: %s" % arm.name, icon="ARMATURE_DATA")
 
     def execute(self, context):
         arm = _active_armature(context)
@@ -787,6 +806,7 @@ class EXPORT_OT_mt_framework_lmt(bpy.types.Operator, ExportHelper):
         if self.selected_bones_only and not selected_names:
             self.report({"ERROR"}, "Select the edited bone(s) in Pose Mode before exporting.")
             return {"CANCELLED"}
+
         wm = context.window_manager
         items = wm.mtf_lmt_animation_items
         selected_index = int(wm.mtf_lmt_animation_index)
@@ -795,14 +815,14 @@ class EXPORT_OT_mt_framework_lmt(bpy.types.Operator, ExportHelper):
             self.report({"ERROR"}, "Choose an animation from the named list. Import its LMT Actions first if the list is empty.")
             return {"CANCELLED"}
         target_item = items[selected_index]
-        if search and search not in target_item.action_name.casefold():
+        searchable = "%s %d" % (target_item.action_name, target_item.animation_index)
+        if search and search not in searchable.casefold():
             self.report({"ERROR"}, "Choose a visible animation from the current search results.")
             return {"CANCELLED"}
+
         try:
             from .lmt_export import export_lmt
             raw_source = wm.mtf_lmt_source_path.strip()
-            # Typed or pasted paths may be wrapped in quotes; remove matching
-            # outer quotes and expand common path forms.
             if len(raw_source) >= 2 and raw_source[0] == raw_source[-1] and raw_source[0] in ("\"", "'"):
                 raw_source = raw_source[1:-1].strip()
             source_path = ""
@@ -1022,13 +1042,15 @@ class VIEW3D_PT_mt_framework(bpy.types.Panel):
         r.operator(IMPORT_OT_mt_framework_lmt.bl_idname,
                    text="Import LMT...", icon="IMPORT")
         r2 = box.row()
-        r2.enabled = arm is not None and arm.animation_data is not None and arm.animation_data.action is not None
+        # The export dialog chooses its target from the searchable Action list;
+        # an active Action on the armature is no longer required.
+        r2.enabled = arm is not None
         r2.operator(EXPORT_OT_mt_framework_lmt.bl_idname,
                     text="Export LMT...", icon="EXPORT")
 
 
-_classes = (MTF_LMT_AnimationItem, UI_UL_mtf_lmt_animations,
-            IMPORT_OT_mt_framework_mod, IMPORT_OT_mt_framework_lmt,
+_classes = (IMPORT_OT_mt_framework_mod, IMPORT_OT_mt_framework_lmt,
+            MTF_LMT_AnimationItem, UI_UL_mtf_lmt_animations,
             WM_OT_mtf_lmt_use_selected_file, EXPORT_OT_mt_framework_lmt,
             EXPORT_OT_mt_framework_model, VIEW3D_PT_mt_framework)
 
@@ -1048,10 +1070,11 @@ def register():
         type=MTF_LMT_AnimationItem,
     )
     bpy.types.WindowManager.mtf_lmt_animation_index = IntProperty(
-        name="Selected Animation", default=0, min=0,
+        name="Selected LMT Animation", default=0, min=0,
     )
     bpy.types.WindowManager.mtf_lmt_animation_search = StringProperty(
-        name="Search Animations", default="", update=_on_lmt_animation_search_changed,
+        name="Search Animations", default="", maxlen=256,
+        update=_on_lmt_animation_search_changed,
     )
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
     bpy.types.TOPBAR_MT_file_export.append(menu_func_export)
@@ -1060,12 +1083,14 @@ def register():
 def unregister():
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
     bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)
-    for property_name in (
-        "mtf_lmt_animation_search", "mtf_lmt_animation_index",
-        "mtf_lmt_animation_items", "mtf_lmt_source_path",
+    for prop_name in (
+        "mtf_lmt_animation_search",
+        "mtf_lmt_animation_index",
+        "mtf_lmt_animation_items",
+        "mtf_lmt_source_path",
     ):
-        if hasattr(bpy.types.WindowManager, property_name):
-            delattr(bpy.types.WindowManager, property_name)
+        if hasattr(bpy.types.WindowManager, prop_name):
+            delattr(bpy.types.WindowManager, prop_name)
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)
 
