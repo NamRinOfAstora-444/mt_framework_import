@@ -32,10 +32,12 @@ Every byte offset is a direct port of the MaxScript and must be validated
 against real game files.
 """
 
+# MTF_INDEPENDENT_LMT_REPLACE_UI_V1
+
 bl_info = {
     "name": "MT Framework (MOD/LMT) Importer",
     "author": "axestyra",
-    "version": (0, 21, 27),
+    "version": (0, 21, 28),
     "blender": (3, 0, 0),
     "location": "File > Import > MT Framework Model / Animation",
     "description": "Import/export MT Framework LMT with native BoneID 255 root-motion vector encoding.",
@@ -217,7 +219,6 @@ def _material_image(mat):
 
 def _read_mod_material_names(reader, header):
     """Read the MOD material-name table.
-
     It lives at header.TextureOffset (the MaxScript reads this offset but never
     uses it), 128 bytes per entry, MaterialCount entries. Each mesh's material
     index (part.material // 16) selects a name here; that name binds to the .mrl
@@ -548,7 +549,7 @@ def menu_func_import(self, context):
 
 
 class MTF_LMT_AnimationItem(bpy.types.PropertyGroup):
-    """A named imported Action and the source LMT animation it replaces."""
+    """A source Action or a dense destination slot row."""
     action_name: StringProperty(name="Action Name")
     animation_index: IntProperty(name="Animation ID", default=-1, min=-1)
     is_loop: BoolProperty(name="Loop Segment", default=False)
@@ -556,7 +557,7 @@ class MTF_LMT_AnimationItem(bpy.types.PropertyGroup):
 
 
 def _refresh_lmt_animation_items(context):
-    """Refresh the searchable target list from imported MT Framework Actions."""
+    """Refresh the searchable Source Animation list from imported Blender Actions."""
     wm = context.window_manager
     selected_name = None
     old_index = int(getattr(wm, "mtf_lmt_animation_index", 0))
@@ -607,19 +608,44 @@ def _refresh_lmt_animation_items(context):
     return len(items)
 
 
+def _lmt_animation_item_search_text(item):
+    """Build consistent searchable text for source and destination rows."""
+    parts = [item.action_name, str(item.animation_index)]
+    if item.is_split_segment:
+        parts.append("LOOP" if item.is_loop else "PRE-LOOP")
+        parts.append("PRE" if not item.is_loop else "LOOP")
+    return " ".join(parts).casefold()
+
+
 def _on_lmt_animation_search_changed(wm, context):
     search = (wm.mtf_lmt_animation_search or "").casefold().strip()
     items = wm.mtf_lmt_animation_items
     current = int(wm.mtf_lmt_animation_index)
     if 0 <= current < len(items):
         current_item = items[current]
-        searchable = "%s %d" % (current_item.action_name, current_item.animation_index)
-        if search in searchable.casefold():
+        searchable = _lmt_animation_item_search_text(current_item)
+        if search in searchable:
             return
     for index, item in enumerate(items):
-        searchable = "%s %d" % (item.action_name, item.animation_index)
-        if not search or search in searchable.casefold():
+        searchable = _lmt_animation_item_search_text(item)
+        if not search or search in searchable:
             wm.mtf_lmt_animation_index = index
+            return
+
+
+def _on_lmt_destination_search_changed(wm, context):
+    search = (wm.mtf_lmt_destination_search or "").casefold().strip()
+    items = wm.mtf_lmt_destination_items
+    current = int(wm.mtf_lmt_destination_index)
+    if 0 <= current < len(items):
+        current_item = items[current]
+        searchable = _lmt_animation_item_search_text(current_item)
+        if search in searchable:
+            return
+    for index, item in enumerate(items):
+        searchable = _lmt_animation_item_search_text(item)
+        if not search or search in searchable:
+            wm.mtf_lmt_destination_index = index
             return
 
 
@@ -627,11 +653,14 @@ class UI_UL_mtf_lmt_animations(bpy.types.UIList):
     """Searchable list of named Actions / LMT animation targets."""
     def filter_items(self, context, data, property_name):
         items = getattr(data, property_name)
-        search = (context.window_manager.mtf_lmt_animation_search or "").casefold().strip()
+        wm = context.window_manager
+        search_value = (wm.mtf_lmt_destination_search if property_name == "mtf_lmt_destination_items"
+                        else wm.mtf_lmt_animation_search)
+        search = (search_value or "").casefold().strip()
         flags = []
         for item in items:
-            searchable = "%s %d" % (item.action_name, item.animation_index)
-            visible = not search or search in searchable.casefold()
+            searchable = _lmt_animation_item_search_text(item)
+            visible = not search or search in searchable
             flags.append(self.bitflag_filter_item if visible else 0)
         return flags, []
 
@@ -641,7 +670,51 @@ class UI_UL_mtf_lmt_animations(bpy.types.UIList):
         row.label(text=item.action_name, icon="ACTION")
         row.label(text="ID %03d" % item.animation_index)
         if item.is_split_segment:
-            row.label(text="LOOP" if item.is_loop else "PRE", icon="FILE_REFRESH")
+            row.label(text="LOOP" if item.is_loop else "PRE-LOOP",
+                      icon="FILE_REFRESH")
+
+
+
+def _refresh_lmt_destination_items(context):
+    # Read populated animation slots from the chosen Destination LMT.
+    wm = context.window_manager
+    raw_path = (wm.mtf_lmt_destination_path or "").strip()
+    if len(raw_path) >= 2 and raw_path[0] == raw_path[-1] and raw_path[0] in ("\"", "'"):
+        raw_path = raw_path[1:-1].strip()
+    path = os.path.normpath(
+        bpy.path.abspath(os.path.expandvars(os.path.expanduser(raw_path)))
+    ) if raw_path else ""
+    if not path or not os.path.isfile(path):
+        raise ValueError("Destination LMT path is empty or does not exist.")
+    if not path.lower().endswith(".lmt"):
+        raise ValueError("Destination file must have the .lmt extension.")
+    from .lmt_export import list_lmt_animations
+    slots = list_lmt_animations(path)
+    items = wm.mtf_lmt_destination_items
+    items.clear()
+    for slot in slots:
+        animation_id = int(slot["animation_index"])
+        animation_name = "Animation %03d" % animation_id
+        if slot.get("is_split_segment", False):
+            # PRE-LOOP and LOOP are two timeline regions in the same LMT slot.
+            # Keep the same dense animation ID so either row resolves to that
+            # one physical destination clip; export replaces the paired clip.
+            for is_loop in (False, True):
+                item = items.add()
+                item.action_name = animation_name
+                item.animation_index = animation_id
+                item.is_loop = is_loop
+                item.is_split_segment = True
+        else:
+            item = items.add()
+            item.action_name = animation_name
+            item.animation_index = animation_id
+            item.is_loop = False
+            item.is_split_segment = False
+    wm.mtf_lmt_destination_index = 0
+    wm.mtf_lmt_destination_path = path
+    wm.mtf_lmt_destination_loaded_path = path
+    return len(slots)
 
 
 class IMPORT_OT_mt_framework_lmt(bpy.types.Operator, ImportHelper):
@@ -690,7 +763,7 @@ class IMPORT_OT_mt_framework_lmt(bpy.types.Operator, ImportHelper):
         if arm is None:
             box.label(text="Select the imported armature first", icon="ERROR")
         else:
-            box.label(text="Target: %s" % arm.name, icon="ARMATURE_DATA")
+            box.label(text="Armature: %s" % arm.name, icon="ARMATURE_DATA")
 
     def execute(self, context):
         arm = _active_armature(context)
@@ -724,7 +797,7 @@ class IMPORT_OT_mt_framework_lmt(bpy.types.Operator, ImportHelper):
 
 class EXPORT_OT_mt_framework_lmt(bpy.types.Operator, ExportHelper):
     bl_idname = "export_scene.mt_framework_lmt"
-    bl_label = "Export MT Framework Animation"
+    bl_label = "MT Framework Animation"
     bl_options = {"REGISTER"}
 
     filename_ext = ".lmt"
@@ -734,113 +807,160 @@ class EXPORT_OT_mt_framework_lmt(bpy.types.Operator, ExportHelper):
         description="Reserved for newer LMT variants; currently unsupported by safe export")
     selected_bones_only: BoolProperty(
         name="Export Selected Bones Only", default=False,
-        description="Only rewrite tracks belonging to selected pose bones; preserve all other tracks and codecs")
+        description="Only rewrite destination tracks belonging to selected pose bones")
 
     def invoke(self, context, event):
         _refresh_lmt_animation_items(context)
+        wm = context.window_manager
+        if wm.mtf_lmt_destination_path and not wm.mtf_lmt_destination_items:
+            try:
+                _refresh_lmt_destination_items(context)
+            except Exception as exc:
+                print("Destination LMT list refresh: %s" % exc)
         return ExportHelper.invoke(self, context, event)
 
     def draw(self, context):
         layout = self.layout
         wm = context.window_manager
-        layout.label(text="Replace one named animation in a copy of an existing LMT.")
-        layout.prop(wm, "mtf_lmt_source_path", text="Source LMT")
-        layout.operator(
-            "wm.mtf_lmt_use_selected_file",
-            text="Use Selected File as Source",
-            icon="FILE_TICK",
-        )
-        layout.separator()
-        layout.label(text="Search by animation / Action name / ID")
-        arm_for_filter = _active_armature(context)
-        if arm_for_filter is not None:
-            layout.label(text="Actions tagged to: %s" % arm_for_filter.name, icon="ARMATURE_DATA")
-        layout.prop(wm, "mtf_lmt_animation_search", text="", icon="VIEWZOOM")
-        layout.template_list(
-            "UI_UL_mtf_lmt_animations", "mtf_lmt_replace_targets",
+
+        source_box = layout.box()
+        source_box.label(text="SOURCE ANIMATION — Imported Blender Actions", icon="ACTION")
+        arm = _active_armature(context)
+        if arm is not None:
+            source_box.label(text="Actions tagged to: %s" % arm.name, icon="ARMATURE_DATA")
+        source_box.prop(wm, "mtf_lmt_animation_search", text="", icon="VIEWZOOM")
+        source_box.template_list(
+            "UI_UL_mtf_lmt_animations", "mtf_lmt_source_actions",
             wm, "mtf_lmt_animation_items",
             wm, "mtf_lmt_animation_index",
-            rows=6,
+            rows=5,
         )
-        items = wm.mtf_lmt_animation_items
-        selected_index = int(wm.mtf_lmt_animation_index)
-        search = (wm.mtf_lmt_animation_search or "").casefold().strip()
-        target = None
-        if 0 <= selected_index < len(items):
-            candidate = items[selected_index]
+        source_items = wm.mtf_lmt_animation_items
+        source_index = int(wm.mtf_lmt_animation_index)
+        source_search = (wm.mtf_lmt_animation_search or "").casefold().strip()
+        source_item = None
+        if 0 <= source_index < len(source_items):
+            candidate = source_items[source_index]
             searchable = "%s %d" % (candidate.action_name, candidate.animation_index)
-            if not search or search in searchable.casefold():
-                target = candidate
-        if target is not None:
-            layout.label(
-                text="Target: %s (LMT animation ID %d)" %
-                     (target.action_name, target.animation_index),
+            if not source_search or source_search in searchable.casefold():
+                source_item = candidate
+        if source_item is not None:
+            source_box.label(
+                text="Source: %s (source ID %d)" %
+                     (source_item.action_name, source_item.animation_index),
                 icon="CHECKMARK",
             )
-            if target.is_split_segment:
-                layout.label(
-                    text="PRE-LOOP + LOOP are merged into one LMT animation. This Action is one half of that pair.",
+            if source_item.is_split_segment:
+                source_box.label(text="PRE-LOOP + LOOP will be combined from the two source Actions.",
+                                 icon="INFO")
+        elif not source_items:
+            source_box.label(text="No imported Actions. Import the source LMT animation first.",
+                             icon="ERROR")
+
+        dest_box = layout.box()
+        dest_box.label(text="DESTINATION LMT — Container to modify", icon="FILE_FOLDER")
+        dest_box.prop(wm, "mtf_lmt_destination_path", text="Destination")
+        row = dest_box.row(align=True)
+        row.operator("wm.mtf_lmt_use_selected_file",
+                     text="Use Selected File as Destination", icon="FILE_TICK")
+        row.operator("wm.mtf_lmt_refresh_destination",
+                     text="Load / Refresh Slots", icon="FILE_REFRESH")
+        dest_box.prop(wm, "mtf_lmt_destination_search", text="", icon="VIEWZOOM")
+        dest_box.template_list(
+            "UI_UL_mtf_lmt_animations", "mtf_lmt_destination_slots",
+            wm, "mtf_lmt_destination_items",
+            wm, "mtf_lmt_destination_index",
+            rows=6,
+        )
+        dest_items = wm.mtf_lmt_destination_items
+        dest_index = int(wm.mtf_lmt_destination_index)
+        dest_search = (wm.mtf_lmt_destination_search or "").casefold().strip()
+        dest_item = None
+        if 0 <= dest_index < len(dest_items):
+            candidate = dest_items[dest_index]
+            searchable = _lmt_animation_item_search_text(candidate)
+            if not dest_search or dest_search in searchable:
+                dest_item = candidate
+        if dest_item is not None:
+            segment_label = " — %s" % ("LOOP" if dest_item.is_loop else "PRE-LOOP") \
+                if dest_item.is_split_segment else ""
+            dest_box.label(text="Target: Destination Animation ID %d%s" %
+                           (dest_item.animation_index, segment_label), icon="CHECKMARK")
+            if dest_item.is_split_segment:
+                dest_box.label(
+                    text="PRE-LOOP and LOOP share one LMT slot; Replace writes the paired animation.",
                     icon="INFO",
                 )
-        elif not items:
-            layout.label(text="No imported LMT Actions found. Import the target LMT animations first.", icon="ERROR")
-        else:
-            layout.label(text="Select an animation from the visible search results.", icon="INFO")
+        elif not dest_items:
+            dest_box.label(text="Choose a Destination LMT and load its populated slots.",
+                           icon="ERROR")
+
+        layout.separator()
         layout.prop(self, "arch_64bit")
         layout.prop(self, "selected_bones_only")
-        layout.separator()
-        layout.label(text="Output must differ from source; original is never overwritten.", icon="INFO")
-        layout.label(text="Native LMT v51+ layout; 64-bit layouts are not supported.")
-        arm = _active_armature(context)
+        layout.label(text="Source ID and Destination ID are independent.", icon="INFO")
+        layout.label(text="Output is a new file; Destination LMT is never overwritten.")
+        layout.label(text="Native LMT v51+; 64-bit layouts are not supported.")
         if arm is None:
             layout.label(text="Select an armature first", icon="ERROR")
-        else:
-            layout.label(text="Armature: %s" % arm.name, icon="ARMATURE_DATA")
 
     def execute(self, context):
         arm = _active_armature(context)
         if arm is None:
             self.report({"ERROR"}, "Select an armature before exporting LMT.")
             return {"CANCELLED"}
+
         selected_names = [pb.name for pb in arm.pose.bones if pb.bone.select]
         if self.selected_bones_only and not selected_names:
             self.report({"ERROR"}, "Select the edited bone(s) in Pose Mode before exporting.")
             return {"CANCELLED"}
 
         wm = context.window_manager
-        items = wm.mtf_lmt_animation_items
-        selected_index = int(wm.mtf_lmt_animation_index)
-        search = (wm.mtf_lmt_animation_search or "").casefold().strip()
-        if not items or not (0 <= selected_index < len(items)):
-            self.report({"ERROR"}, "Choose an animation from the named list. Import its LMT Actions first if the list is empty.")
+        source_items = wm.mtf_lmt_animation_items
+        source_index = int(wm.mtf_lmt_animation_index)
+        source_search = (wm.mtf_lmt_animation_search or "").casefold().strip()
+        if not source_items or not (0 <= source_index < len(source_items)):
+            self.report({"ERROR"}, "Choose a Source Animation Action. Import the source LMT first.")
             return {"CANCELLED"}
-        target_item = items[selected_index]
-        searchable = "%s %d" % (target_item.action_name, target_item.animation_index)
-        if search and search not in searchable.casefold():
-            self.report({"ERROR"}, "Choose a visible animation from the current search results.")
+        source_item = source_items[source_index]
+        source_query = _lmt_animation_item_search_text(source_item)
+        if source_search and source_search not in source_query:
+            self.report({"ERROR"}, "Choose a visible Source Action from the search results.")
+            return {"CANCELLED"}
+
+        dest_items = wm.mtf_lmt_destination_items
+        dest_index = int(wm.mtf_lmt_destination_index)
+        dest_search = (wm.mtf_lmt_destination_search or "").casefold().strip()
+        if not dest_items or not (0 <= dest_index < len(dest_items)):
+            self.report({"ERROR"}, "Choose and load a Destination LMT animation slot.")
+            return {"CANCELLED"}
+        dest_item = dest_items[dest_index]
+        dest_query = _lmt_animation_item_search_text(dest_item)
+        if dest_search and dest_search not in dest_query:
+            self.report({"ERROR"}, "Choose a visible Destination slot from the search results.")
+            return {"CANCELLED"}
+
+        raw_dest = (wm.mtf_lmt_destination_path or "").strip()
+        if len(raw_dest) >= 2 and raw_dest[0] == raw_dest[-1] and raw_dest[0] in ("\"", "'"):
+            raw_dest = raw_dest[1:-1].strip()
+        destination_path = os.path.normpath(
+            bpy.path.abspath(os.path.expandvars(os.path.expanduser(raw_dest)))
+        ) if raw_dest else ""
+        if not destination_path or not os.path.isfile(destination_path):
+            self.report({"ERROR"}, "Destination LMT path is empty or does not exist.")
+            return {"CANCELLED"}
+        loaded_path = os.path.normpath(bpy.path.abspath(wm.mtf_lmt_destination_loaded_path)) if wm.mtf_lmt_destination_loaded_path else ""
+        if not loaded_path or loaded_path != destination_path:
+            self.report({"ERROR"}, "Destination path changed. Click 'Load / Refresh Slots' before exporting.")
             return {"CANCELLED"}
 
         try:
             from .lmt_export import export_lmt
-            raw_source = wm.mtf_lmt_source_path.strip()
-            if len(raw_source) >= 2 and raw_source[0] == raw_source[-1] and raw_source[0] in ("\"", "'"):
-                raw_source = raw_source[1:-1].strip()
-            source_path = ""
-            if raw_source:
-                source_path = os.path.normpath(
-                    bpy.path.abspath(os.path.expandvars(os.path.expanduser(raw_source)))
-                )
-            if not source_path or not os.path.isfile(source_path):
-                self.report({"ERROR"}, "Source LMT path is empty or does not exist. Enter the full path to an existing .lmt file.")
-                return {"CANCELLED"}
-            if not source_path.lower().endswith(".lmt"):
-                self.report({"ERROR"}, "Source file must have the .lmt extension.")
-                return {"CANCELLED"}
             count = export_lmt(
                 self.filepath, arm, context.scene,
-                source_lmt=source_path,
-                slot_index=target_item.animation_index,
-                target_action_name=target_item.action_name,
+                destination_lmt=destination_path,
+                destination_animation_id=dest_item.animation_index,
+                source_action_name=source_item.action_name,
                 x64=self.arch_64bit,
                 selected_bones=selected_names if self.selected_bones_only else None,
             )
@@ -849,16 +969,16 @@ class EXPORT_OT_mt_framework_lmt(bpy.types.Operator, ExportHelper):
             import traceback
             traceback.print_exc()
             return {"CANCELLED"}
-        self.report({"INFO"}, "Exported target '%s'; %d track(s) updated." %
-                    (target_item.action_name, count))
+
+        self.report({"INFO"}, "Replaced Destination ID %d using '%s'; %d track(s) updated." %
+                    (dest_item.animation_index, source_item.action_name, count))
         return {"FINISHED"}
 
-
 class WM_OT_mtf_lmt_use_selected_file(bpy.types.Operator):
-    """Copy the active file-browser entry into the Source LMT textbox."""
+    'Use the active file-browser entry as Destination LMT.'
     bl_idname = "wm.mtf_lmt_use_selected_file"
-    bl_label = "Use Selected File as Source"
-    bl_description = "Use the currently active file in this Blender file browser as Source LMT"
+    bl_label = "Use Selected File as Destination"
+    bl_description = "Load the active .lmt file-browser entry as the replacement destination"
     bl_options = {"INTERNAL"}
 
     def execute(self, context):
@@ -866,12 +986,10 @@ class WM_OT_mtf_lmt_use_selected_file(bpy.types.Operator):
         if not space or getattr(space, "type", None) != "FILE_BROWSER":
             self.report({"ERROR"}, "Use this button from the Export LMT file browser.")
             return {"CANCELLED"}
-
         params = getattr(space, "params", None)
         if params is None:
             self.report({"ERROR"}, "Could not read the file-browser selection.")
             return {"CANCELLED"}
-
         directory = getattr(params, "directory", "") or ""
         if isinstance(directory, bytes):
             directory = os.fsdecode(directory)
@@ -879,22 +997,36 @@ class WM_OT_mtf_lmt_use_selected_file(bpy.types.Operator):
         if not filename:
             self.report({"ERROR"}, "Select an existing .lmt file in the left file list first.")
             return {"CANCELLED"}
-
-        # Some Blender versions expose a directory ending in a separator; normpath
-        # safely handles both that case and Windows-style paths.
         path = filename if os.path.isabs(filename) else os.path.join(directory, filename)
         path = os.path.normpath(bpy.path.abspath(os.path.expandvars(os.path.expanduser(path))))
-        if not os.path.isfile(path):
-            self.report({"ERROR"}, "The active file is not an existing file: %s" % path)
+        if not os.path.isfile(path) or not path.lower().endswith(".lmt"):
+            self.report({"ERROR"}, "Select an existing .lmt file in the left file list.")
             return {"CANCELLED"}
-        if not path.lower().endswith(".lmt"):
-            self.report({"ERROR"}, "Select a .lmt file in the left file list.")
+        context.window_manager.mtf_lmt_destination_path = path
+        try:
+            count = _refresh_lmt_destination_items(context)
+        except Exception as exc:
+            self.report({"ERROR"}, "Could not load Destination LMT: %s" % exc)
             return {"CANCELLED"}
-
-        context.window_manager.mtf_lmt_source_path = path
-        self.report({"INFO"}, "Source LMT set to %s" % os.path.basename(path))
+        self.report({"INFO"}, "Loaded %d destination animation slot(s) from %s." %
+                    (count, os.path.basename(path)))
         return {"FINISHED"}
 
+
+class WM_OT_mtf_lmt_refresh_destination(bpy.types.Operator):
+    'Refresh destination slots from the Destination LMT path field.'
+    bl_idname = "wm.mtf_lmt_refresh_destination"
+    bl_label = "Load / Refresh Destination Slots"
+    bl_options = {"INTERNAL"}
+
+    def execute(self, context):
+        try:
+            count = _refresh_lmt_destination_items(context)
+        except Exception as exc:
+            self.report({"ERROR"}, "Could not load Destination LMT: %s" % exc)
+            return {"CANCELLED"}
+        self.report({"INFO"}, "Loaded %d destination animation slot(s)." % count)
+        return {"FINISHED"}
 
 class EXPORT_OT_mt_framework_model(bpy.types.Operator, ExportHelper):
     """Create a new MOD/MOD3 binary from selected Blender mesh objects."""
@@ -1051,30 +1183,43 @@ class VIEW3D_PT_mt_framework(bpy.types.Panel):
 
 _classes = (IMPORT_OT_mt_framework_mod, IMPORT_OT_mt_framework_lmt,
             MTF_LMT_AnimationItem, UI_UL_mtf_lmt_animations,
-            WM_OT_mtf_lmt_use_selected_file, EXPORT_OT_mt_framework_lmt,
-            EXPORT_OT_mt_framework_model, VIEW3D_PT_mt_framework)
+            WM_OT_mtf_lmt_use_selected_file, WM_OT_mtf_lmt_refresh_destination,
+            EXPORT_OT_mt_framework_lmt, EXPORT_OT_mt_framework_model,
+            VIEW3D_PT_mt_framework)
 
 
 def register():
     for cls in _classes:
         bpy.utils.register_class(cls)
-    # Plain editable source-path field; the adjacent operator can copy the
-    # active file-browser entry into it. No FILE_PATH subtype means no browse button.
-    bpy.types.WindowManager.mtf_lmt_source_path = StringProperty(
-        name="Source LMT",
-        default="",
-        maxlen=4096,
-        description="Full path to the original game LMT; enter or paste a path, or select a file and use the button below.",
+    # Source Actions are already imported into Blender; the source LMT file is
+    # no longer required after import. Destination LMT is a separate container.
+    bpy.types.WindowManager.mtf_lmt_destination_path = StringProperty(
+        name="Destination LMT", default="", maxlen=4096,
+        description="LMT file whose selected animation slot will be replaced.",
+    )
+    bpy.types.WindowManager.mtf_lmt_destination_loaded_path = StringProperty(
+        name="Loaded Destination LMT", default="", maxlen=4096,
+        options={"HIDDEN"},
     )
     bpy.types.WindowManager.mtf_lmt_animation_items = CollectionProperty(
         type=MTF_LMT_AnimationItem,
     )
     bpy.types.WindowManager.mtf_lmt_animation_index = IntProperty(
-        name="Selected LMT Animation", default=0, min=0,
+        name="Source Action", default=0, min=0,
     )
     bpy.types.WindowManager.mtf_lmt_animation_search = StringProperty(
-        name="Search Animations", default="", maxlen=256,
+        name="Search Source Actions", default="", maxlen=256,
         update=_on_lmt_animation_search_changed,
+    )
+    bpy.types.WindowManager.mtf_lmt_destination_items = CollectionProperty(
+        type=MTF_LMT_AnimationItem,
+    )
+    bpy.types.WindowManager.mtf_lmt_destination_index = IntProperty(
+        name="Destination Animation", default=0, min=0,
+    )
+    bpy.types.WindowManager.mtf_lmt_destination_search = StringProperty(
+        name="Search Destination Slots", default="", maxlen=256,
+        update=_on_lmt_destination_search_changed,
     )
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
     bpy.types.TOPBAR_MT_file_export.append(menu_func_export)
@@ -1084,10 +1229,14 @@ def unregister():
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
     bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)
     for prop_name in (
+        "mtf_lmt_destination_search",
+        "mtf_lmt_destination_index",
+        "mtf_lmt_destination_items",
+        "mtf_lmt_destination_path",
+        "mtf_lmt_destination_loaded_path",
         "mtf_lmt_animation_search",
         "mtf_lmt_animation_index",
         "mtf_lmt_animation_items",
-        "mtf_lmt_source_path",
     ):
         if hasattr(bpy.types.WindowManager, prop_name):
             delattr(bpy.types.WindowManager, prop_name)
