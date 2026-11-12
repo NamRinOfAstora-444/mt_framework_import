@@ -71,28 +71,64 @@ def _read_source(path, slot, x64=False):
     return data, version, count, offsets, slot, frame_count, loop_frame, defs
 
 
+
 def _bone_by_mtf_index(arm, bone_id):
-    # Preserve the addon's MHGU/DMC4SE remap semantics.
+    """Resolve LMT bone IDs, including Bone 255 root tracks."""
     remap = list(arm.get("mtf_remaptable", []))
     rootid = int(arm.get("mtf_lmt_rootid", 255))
+
+    # Root Bone must always be resolved independently of selection.
+    # Match the same resolution order used by lmt_import.py.
     if bone_id == rootid or bone_id == 255:
+        # 1. Explicit game root mapping.
         game_root = arm.get("mtf_game_root_bone")
-        if game_root and arm.pose.bones.get(game_root):
-            return arm.pose.bones.get(game_root)
+        if game_root:
+            pb = arm.pose.bones.get(game_root)
+            if pb is not None:
+                return pb
+
+        # 2. Original synthetic root name.
         root_name = arm.get("mtf_root_bone", "bone255")
-        if arm.pose.bones.get(root_name):
-            return arm.pose.bones.get(root_name)
+        pb = arm.pose.bones.get(root_name)
+        if pb is not None:
+            return pb
+
+        # 3. Persistent MT Framework bone index.
+        for pb in arm.pose.bones:
+            try:
+                if int(pb.bone.get("mtf_index", -1)) == 255:
+                    return pb
+            except (TypeError, ValueError):
+                continue
+
+        # 4. Compatibility fallback for older armatures.
+        for pb in arm.pose.bones:
+            if pb.bone.parent is None and not pb.bone.use_deform:
+                return pb
+
+        # Match importer's final fallback.
+        bones = list(arm.pose.bones)
+        if bones:
+            return bones[0]
+
+        return None
+
+    # Normal bone remapping.
     idx = bone_id
     if remap and 0 <= bone_id < len(remap):
         idx = int(remap[bone_id])
+
+        # 255 is reserved for the root track.
         if idx == 255:
             return None
+
     for pb in arm.pose.bones:
         try:
             if int(pb.bone.get("mtf_index", -1)) == idx:
                 return pb
         except (TypeError, ValueError):
-            pass
+            continue
+
     return None
 
 
