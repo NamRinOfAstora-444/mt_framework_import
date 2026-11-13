@@ -1181,16 +1181,393 @@ class VIEW3D_PT_mt_framework(bpy.types.Panel):
                     text="Export LMT...", icon="EXPORT")
 
 
+# ---------------------------------------------------------------------------
+# Bone ID Manager
+# ---------------------------------------------------------------------------
+def _bone_manager_current_id(arm, bone):
+    """Return the LMT-facing Bone ID for a Blender armature bone."""
+    if arm is None or bone is None:
+        return None
+
+    root_names = {
+        str(arm.get("mtf_root_bone", "") or ""),
+        str(arm.get("mtf_game_root_bone", "") or ""),
+    }
+    try:
+        scene_index = int(bone.get("mtf_index", -1))
+    except (TypeError, ValueError):
+        scene_index = -1
+
+    if scene_index == 255 or bone.name in root_names:
+        return 255
+
+    remap = list(arm.get("mtf_remaptable", []))
+    if remap:
+        # A MOD-imported rig stores its original skeleton index on the Bone;
+        # the remap table converts LMT IDs into those skeleton indices.
+        for lmt_id, mapped_index in enumerate(remap):
+            try:
+                mapped_index = int(mapped_index)
+            except (TypeError, ValueError):
+                continue
+            if lmt_id != 255 and mapped_index == scene_index and scene_index >= 0:
+                return lmt_id
+        return None
+
+    return scene_index if 0 <= scene_index <= 254 else None
+
+
+def _bone_manager_get_selected(context):
+    """Resolve the bone currently selected in the Bone ID Manager list."""
+    arm = _active_armature(context)
+    if arm is None or arm.type != "ARMATURE":
+        return None, None
+
+    try:
+        index = int(arm.data.mtf_bone_id_index)
+    except (AttributeError, TypeError, ValueError):
+        index = -1
+
+    bones = arm.data.bones
+    if 0 <= index < len(bones):
+        return arm, bones[index]
+
+    active = bones.active
+    if active is not None:
+        return arm, active
+    return arm, None
+
+
+def _bone_manager_assign_id(arm, bone, bone_id):
+    """Assign or edit one LMT Bone ID without changing MOD skeleton indices."""
+    bone_id = int(bone_id)
+    if not 0 <= bone_id <= 255:
+        raise ValueError("Bone ID must be between 0 and 255.")
+
+    try:
+        scene_index = int(bone.get("mtf_index", -1))
+    except (TypeError, ValueError):
+        scene_index = -1
+
+    root_name = str(arm.get("mtf_root_bone", "") or "")
+    game_root_name = str(arm.get("mtf_game_root_bone", "") or "")
+    is_root = scene_index == 255 or bone.name in {root_name, game_root_name}
+    remap = list(arm.get("mtf_remaptable", []))
+
+    if bone_id == 255:
+        # Root motion is resolved by a dedicated code path in both LMT import
+        # and export. Preserve an already-designated game root as-is; for a
+        # custom rig, assigning 255 designates this bone as its root controller.
+        if is_root:
+            arm["mtf_lmt_rootid"] = 255
+            if not root_name and scene_index == 255:
+                arm["mtf_root_bone"] = bone.name
+            return
+        if remap and scene_index != 255:
+            raise ValueError("Bone ID 255 is reserved for the MOD root bone (index 255).")
+        for other in arm.data.bones:
+            if other == bone:
+                continue
+            try:
+                other_id = int(other.get("mtf_index", -1))
+            except (TypeError, ValueError):
+                other_id = -1
+            if other_id == 255 or other.name in {root_name, game_root_name}:
+                raise ValueError("Bone ID 255 is already assigned to %s." % other.name)
+        bone["mtf_index"] = 255
+        arm["mtf_root_bone"] = bone.name
+        arm["mtf_lmt_rootid"] = 255
+        return
+
+    if is_root:
+        raise ValueError("Bone ID 255 is reserved for the MT root bone.")
+
+    if remap:
+        # Preserve the MOD skeleton index in Bone["mtf_index"].  Only edit the
+        # LMT-ID -> skeleton-index table consumed by lmt_import.py/export.py.
+        if scene_index < 0 or scene_index == 255:
+            raise ValueError("This bone has no valid MOD skeleton index for remapping.")
+
+        if bone_id < len(remap):
+            try:
+                occupied = int(remap[bone_id])
+            except (TypeError, ValueError):
+                occupied = 255
+            if occupied not in (255, scene_index):
+                other = None
+                for candidate in arm.data.bones:
+                    try:
+                        candidate_index = int(candidate.get("mtf_index", -1))
+                    except (TypeError, ValueError):
+                        candidate_index = -1
+                    if candidate_index == occupied:
+                        other = candidate.name
+                        break
+                raise ValueError("Bone ID %d is already mapped to %s." %
+                                 (bone_id, other or ("skeleton index %d" % occupied)))
+
+        # Keep this UI one-ID-per-bone: remove aliases for this scene bone,
+        # then write the requested LMT ID.  All unrelated mappings stay intact.
+        for index, mapped in enumerate(remap):
+            try:
+                mapped = int(mapped)
+            except (TypeError, ValueError):
+                continue
+            if index != bone_id and index != 255 and mapped == scene_index:
+                remap[index] = 255
+
+        if bone_id >= len(remap):
+            remap.extend([255] * (bone_id + 1 - len(remap)))
+        remap[bone_id] = scene_index
+        arm["mtf_remaptable"] = remap
+        return
+
+    # A custom Blender armature has no MOD remap table: Bone["mtf_index"] is
+    # the direct persistent LMT ID used by the existing importer and exporter.
+    for other in arm.data.bones:
+        if other == bone:
+            continue
+        try:
+            other_id = int(other.get("mtf_index", -1))
+        except (TypeError, ValueError):
+            other_id = -1
+        if other_id == bone_id:
+            raise ValueError("Bone ID %d is already assigned to %s." %
+                             (bone_id, other.name))
+
+    bone["mtf_index"] = bone_id
+
+
+def _bone_manager_delete_id(arm, bone):
+    current_id = _bone_manager_current_id(arm, bone)
+    if current_id is None:
+        raise ValueError("The selected bone does not have a Bone ID to delete.")
+    if current_id == 255:
+        raise ValueError("Bone ID 255 is the root-motion ID and cannot be deleted.")
+
+    remap = list(arm.get("mtf_remaptable", []))
+    if remap:
+        try:
+            scene_index = int(bone.get("mtf_index", -1))
+        except (TypeError, ValueError):
+            scene_index = -1
+        changed = False
+        for index, mapped in enumerate(remap):
+            try:
+                mapped = int(mapped)
+            except (TypeError, ValueError):
+                continue
+            if index != 255 and mapped == scene_index:
+                remap[index] = 255
+                changed = True
+        if changed:
+            arm["mtf_remaptable"] = remap
+    elif "mtf_index" in bone:
+        del bone["mtf_index"]
+
+
+def _on_bone_id_index_changed(arm_data, context):
+    """Keep the Pose Mode active bone in sync with the list selection."""
+    if context is None or getattr(context, "mode", None) != "POSE":
+        return
+    arm = _active_armature(context)
+    if arm is None or arm.data != arm_data:
+        return
+
+    try:
+        index = int(arm_data.mtf_bone_id_index)
+        if not 0 <= index < len(arm_data.bones):
+            return
+        target = arm_data.bones[index]
+        for bone in arm_data.bones:
+            bone.select = (bone == target)
+        arm_data.bones.active = target
+        current_id = _bone_manager_current_id(arm, target)
+        if hasattr(context.window_manager, "mtf_bone_id_value"):
+            context.window_manager.mtf_bone_id_value = (
+                current_id if current_id is not None else 0)
+    except (AttributeError, TypeError, ValueError, RuntimeError):
+        return
+
+
+class UI_UL_mtf_bone_ids(bpy.types.UIList):
+    """Searchable Bone list showing name and its LMT-facing ID."""
+    def filter_items(self, context, data, property_name):
+        bones = getattr(data, property_name)
+        wm = context.window_manager
+        search = (wm.mtf_bone_id_search or "").casefold().strip()
+        arm = _active_armature(context)
+        flags = []
+        for bone in bones:
+            current_id = _bone_manager_current_id(arm, bone)
+            id_text = str(current_id) if current_id is not None else "no id"
+            searchable = (bone.name + " " + id_text).casefold()
+            flags.append(self.bitflag_filter_item if not search or search in searchable else 0)
+        return flags, []
+
+    def draw_item(self, context, layout, data, item, icon, active_data,
+                  active_property, index):
+        arm = _active_armature(context)
+        current_id = _bone_manager_current_id(arm, item)
+        row = layout.row(align=True)
+        row.label(text=item.name, icon="BONE_DATA")
+        row.label(text=("ID %03d" % current_id) if current_id is not None else "No ID")
+
+
+class WM_OT_mtf_bone_id_apply(bpy.types.Operator):
+    bl_idname = "wm.mtf_bone_id_apply"
+    bl_label = "Apply Bone ID"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        if context.mode != "POSE":
+            self.report({"ERROR"}, "Switch the Armature to Pose Mode first.")
+            return {"CANCELLED"}
+        arm, bone = _bone_manager_get_selected(context)
+        if arm is None or bone is None:
+            self.report({"ERROR"}, "Select a bone from the Bone ID list.")
+            return {"CANCELLED"}
+        try:
+            _bone_manager_assign_id(
+                arm, bone, context.window_manager.mtf_bone_id_value)
+        except (TypeError, ValueError) as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        self.report({"INFO"}, "Bone ID saved for %s." % bone.name)
+        if context.area:
+            context.area.tag_redraw()
+        return {"FINISHED"}
+
+
+class WM_OT_mtf_bone_id_remove(bpy.types.Operator):
+    bl_idname = "wm.mtf_bone_id_remove"
+    bl_label = "Delete Bone ID"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        if context.mode != "POSE":
+            self.report({"ERROR"}, "Switch the Armature to Pose Mode first.")
+            return {"CANCELLED"}
+        arm, bone = _bone_manager_get_selected(context)
+        if arm is None or bone is None:
+            self.report({"ERROR"}, "Select a bone from the Bone ID list.")
+            return {"CANCELLED"}
+        try:
+            _bone_manager_delete_id(arm, bone)
+        except (TypeError, ValueError) as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        context.window_manager.mtf_bone_id_value = 0
+        self.report({"INFO"}, "Bone ID removed from %s." % bone.name)
+        if context.area:
+            context.area.tag_redraw()
+        return {"FINISHED"}
+
+
+class VIEW3D_PT_mtf_bone_id_manager(bpy.types.Panel):
+    bl_label = "Bone ID Manager"
+    bl_idname = "VIEW3D_PT_mtf_bone_id_manager"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "MT Framework"
+
+    def draw(self, context):
+        layout = self.layout
+        arm = _active_armature(context)
+        if arm is None:
+            layout.label(text="Select an Armature.", icon="INFO")
+            return
+        if context.mode != "POSE":
+            layout.label(text="Switch the Armature to Pose Mode to manage Bone IDs.",
+                         icon="INFO")
+            return
+
+        bones = arm.data.bones
+        if not bones:
+            layout.label(text="This Armature has no bones.", icon="INFO")
+            return
+
+        # Keep the manager's active row synchronized with the Pose viewport.
+        try:
+            active_index = int(arm.data.mtf_bone_id_index)
+        except (AttributeError, TypeError, ValueError):
+            active_index = -1
+        if bones.active is not None:
+            try:
+                viewport_index = list(bones).index(bones.active)
+                if viewport_index != active_index:
+                    arm.data.mtf_bone_id_index = viewport_index
+                    active_index = viewport_index
+            except (ValueError, AttributeError, TypeError):
+                pass
+        if not 0 <= active_index < len(bones) and bones.active is not None:
+            try:
+                arm.data.mtf_bone_id_index = list(bones).index(bones.active)
+                active_index = int(arm.data.mtf_bone_id_index)
+            except (ValueError, AttributeError, TypeError):
+                active_index = -1
+
+        wm = context.window_manager
+        layout.prop(wm, "mtf_bone_id_search", text="", icon="VIEWZOOM")
+        layout.template_list(
+            "UI_UL_mtf_bone_ids", "mtf_bone_id_manager",
+            arm.data, "bones", arm.data, "mtf_bone_id_index",
+            # Keep the action buttons visible in Blender's narrow N-panel.
+            rows=5, maxrows=6,
+        )
+
+        selected = (bones[active_index]
+                    if 0 <= active_index < len(bones) else bones.active)
+        if selected is None:
+            layout.label(text="Select a bone from the list.", icon="INFO")
+            return
+
+        current_id = _bone_manager_current_id(arm, selected)
+        box = layout.box()
+        box.label(text="Selected Bone", icon="BONE_DATA")
+        box.label(text=selected.name)
+        box.label(text=("Current ID: %03d" % current_id)
+                  if current_id is not None else "Current ID: Not assigned")
+        box.prop(wm, "mtf_bone_id_value", text="Bone ID")
+
+        row = box.row(align=True)
+        row.operator(
+            WM_OT_mtf_bone_id_apply.bl_idname,
+            text=("Update" if current_id is not None else "Add ID"),
+            icon=("FILE_TICK" if current_id is not None else "ADD"),
+        )
+        delete_col = row.row(align=True)
+        delete_col.enabled = current_id is not None and current_id != 255
+        delete_col.operator(
+            WM_OT_mtf_bone_id_remove.bl_idname,
+            text="Delete", icon="TRASH",
+        )
+
+
 _classes = (IMPORT_OT_mt_framework_mod, IMPORT_OT_mt_framework_lmt,
             MTF_LMT_AnimationItem, UI_UL_mtf_lmt_animations,
             WM_OT_mtf_lmt_use_selected_file, WM_OT_mtf_lmt_refresh_destination,
+            UI_UL_mtf_bone_ids, WM_OT_mtf_bone_id_apply,
+            WM_OT_mtf_bone_id_remove,
             EXPORT_OT_mt_framework_lmt, EXPORT_OT_mt_framework_model,
-            VIEW3D_PT_mt_framework)
+            VIEW3D_PT_mt_framework, VIEW3D_PT_mtf_bone_id_manager)
 
 
 def register():
     for cls in _classes:
         bpy.utils.register_class(cls)
+    bpy.types.Armature.mtf_bone_id_index = IntProperty(
+        name="Bone ID List Selection", default=0, min=0,
+        update=_on_bone_id_index_changed,
+        options={"HIDDEN"},
+    )
+    bpy.types.WindowManager.mtf_bone_id_search = StringProperty(
+        name="Search Bones", default="", maxlen=256,
+    )
+    bpy.types.WindowManager.mtf_bone_id_value = IntProperty(
+        name="Bone ID", default=0, min=0, max=255,
+        description="LMT Bone ID for the selected Armature bone.",
+    )
     # Source Actions are already imported into Blender; the source LMT file is
     # no longer required after import. Destination LMT is a separate container.
     bpy.types.WindowManager.mtf_lmt_destination_path = StringProperty(
@@ -1229,6 +1606,8 @@ def unregister():
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
     bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)
     for prop_name in (
+        "mtf_bone_id_search",
+        "mtf_bone_id_value",
         "mtf_lmt_destination_search",
         "mtf_lmt_destination_index",
         "mtf_lmt_destination_items",
@@ -1240,6 +1619,8 @@ def unregister():
     ):
         if hasattr(bpy.types.WindowManager, prop_name):
             delattr(bpy.types.WindowManager, prop_name)
+    if hasattr(bpy.types.Armature, "mtf_bone_id_index"):
+        del bpy.types.Armature.mtf_bone_id_index
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)
 
